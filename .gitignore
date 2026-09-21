@@ -1,0 +1,30 @@
+# Environment and secrets
+.env
+.env.*
+*.local
+
+# Claude Code session files
+resume_prompt.md
+checkpoint.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project
+backup/

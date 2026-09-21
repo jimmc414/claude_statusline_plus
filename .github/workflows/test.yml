@@ -1,0 +1,33 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS matters: it ships bash 3.2 and BSD userland, the likeliest place
+        # for a portability break.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Ensure jq
+        run: command -v jq || brew install jq
+      - name: Versions
+        run: bash --version | head -1 && jq --version
+      - run: pip install pytest
+      - run: python -m pytest tests/ -q
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck cache_warm.sh install.sh

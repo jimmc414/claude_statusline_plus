@@ -1,0 +1,3 @@
+# SC2016: "expressions don't expand in single quotes". The flagged $names are
+# jq variables (--arg / --argjson), which must not be expanded by the shell.
+disable=SC2016

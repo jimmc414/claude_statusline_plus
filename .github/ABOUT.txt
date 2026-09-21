@@ -1,0 +1,1 @@
+Show whether Claude Code's prompt cache is still warm in the status line, with a countdown to expiry and the token cost of a cold start, so you know if your next message is a cheap cache read or a full-price re-cache.
