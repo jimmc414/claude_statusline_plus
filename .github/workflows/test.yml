@@ -30,4 +30,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck cache_warm.sh install.sh
+      - run: shellcheck cache_warm.sh usage_forecast.sh statusline_plus.sh install.sh
