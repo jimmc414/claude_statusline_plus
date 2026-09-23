@@ -4,10 +4,14 @@
 #
 # Reads the status line JSON payload on stdin and prints a single segment:
 #
-#     5h 12% · 7d 41% · Fable 78%              on track
-#     5h 48% 1.3× · 7d 41%                     (yellow) burning faster than the window lasts
-#     5h 53% 3.9× cap 15:36 (resets 19:20)     (red) at this pace the limit runs out first
-#     ... · top: refactor auth 57%             the session doing most of the burning
+#     5h 12% (resets in 3h00m) · 7d 41% · Fable 78%        on track
+#     5h 48% 1.3× (resets in 2h40m)                          (yellow) burning faster than the window lasts
+#     5h 53% 3.9× cap 15:36 (resets in 4h20m)                (red) at this pace the limit runs out first
+#     ... · top: refactor auth 57%                           the session doing most of the burning
+#
+# The 5-hour limit always shows a countdown to its reset, and its percentage is
+# green, then yellow from 75% and red from 90%, the level where Claude Code
+# itself warns. The pace and cap time keep their own colors.
 #
 # Prints nothing when there is no limit to show: API-key sessions, and
 # subscription sessions before their first response.
@@ -33,6 +37,8 @@
 #
 # Environment:
 #   USAGE_FORECAST_STYLE          short (default) | long (full sentences)
+#   USAGE_FORECAST_COUNTDOWN      1 (default) | 0 = no countdown to the 5-hour reset
+#   USAGE_FORECAST_LEVELS         where the 5-hour percentage turns yellow,red (default 75,90)
 #   USAGE_FORECAST_TOP            warn (default) | always | never
 #   USAGE_FORECAST_WINDOW         seconds of spend the "top" share covers (default 1800)
 #   USAGE_FORECAST_ACCOUNT        1 (default) | 0 = never read the login or call the usage endpoint
@@ -69,6 +75,15 @@ now="${USAGE_FORECAST_NOW:-}"
 case "$top_mode" in warn|always|never) ;; *) top_mode=warn ;; esac
 case "$style" in short|long) ;; *) style=short ;; esac
 [ "$account_on" = 0 ] || account_on=1
+countdown="${USAGE_FORECAST_COUNTDOWN:-1}"
+[ "$countdown" = 0 ] || countdown=1
+levels="${USAGE_FORECAST_LEVELS:-75,90}"
+if [[ "$levels" =~ ^([0-9]{1,3}),([0-9]{1,3})$ ]] && [ "${BASH_REMATCH[1]}" -ge 1 ] \
+    && [ "${BASH_REMATCH[1]}" -lt "${BASH_REMATCH[2]}" ] && [ "${BASH_REMATCH[2]}" -le 100 ]; then
+    yellow_at=${BASH_REMATCH[1]}; red_at=${BASH_REMATCH[2]}
+else
+    yellow_at=75; red_at=90
+fi
 projects="${projects%/}"
 samples="$cache_dir/usage_samples.tsv"      # 5-hour and weekly readings
 fleet="$cache_dir/fleet.tsv"                # last transcript scan
@@ -420,6 +435,44 @@ def long($a; $name):
   elif $a.yellow then c("38;5;220") + "\($name) \($a.u | pct) used, \($a.pace | x) a sustainable pace." + c("0")
   else "\($name) \($a.u | pct) used." end;
 
+# The 5-hour limit: a countdown to its reset, and a percentage colored by how
+# close it is to the limit. The pace and cap time keep their forecast colors.
+def cd: $countdown == "1";
+def dur: floor as $s
+  | if $s < 60 then "<1m"
+    elif $s < 3600 then "\($s / 60 | floor)m"
+    else "\($s / 3600 | floor)h" + ((($s % 3600) / 60 | floor | tostring) | if length < 2 then "0" + . else . end) + "m" end;
+def level($u): if $u >= $red_at then c("38;5;196") elif $u >= $yellow_at then c("38;5;220") else c("38;5;40") end;
+
+def short5($a):
+  if $a == null then empty else
+    (c("2") + "5h" + c("0") + " ") as $head
+    | (if cd then " (resets in " + (($a.r - $now) | dur) + ")"
+       else c("2") + " (resets " + ($a.r | at($a.len)) + ")" + c("0") end) as $resets
+    | if $a.capped then $head + c("38;5;196") + "100% capped" + c("0") + $resets
+      else
+        $head + level($a.u) + ($a.u | pct) + c("0")
+        + (if $a.red then " " + c("38;5;196") + ($a.pace | x) + " cap " + ($a.eta | at($a.len)) + c("0")
+           elif $a.yellow then " " + c("38;5;220") + ($a.pace | x) + c("0")
+           else "" end)
+        + (if cd or $a.red then $resets else "" end)
+      end
+  end;
+
+def long5($a):
+  if $a == null then empty else
+    (if cd then "resets in " + (($a.r - $now) | dur) else "resets " + ($a.r | at($a.len)) end) as $rs
+    | (if $a.red or $a.u >= $red_at then c("38;5;196")
+       elif $a.yellow or $a.u >= $yellow_at then c("38;5;220") else c("38;5;40") end)
+    + (if $a.capped then "5-hour limit used up, \($rs)."
+       elif $a.red then "5-hour limit \($a.u | pct) used, \($a.pace | x) a sustainable pace: runs out about "
+                        + "\($a.eta | at($a.len)), \($rs)."
+       elif $a.yellow then "5-hour limit \($a.u | pct) used, \($a.pace | x) a sustainable pace"
+                           + (if cd then ", \($rs)." else "." end)
+       else "5-hour limit \($a.u | pct) used" + (if cd then ", \($rs)." else "." end) end)
+    + c("0")
+  end;
+
 (if type == "object" then . else {} end) as $p
 | (($p.rate_limits | objects) // {}) as $rl
 | win($rl.five_hour; 18000) as $w5
@@ -493,14 +546,14 @@ def long($a; $name):
           then "account" else empty end) ] | join(" ")) as $jobs
 
     | (if $style == "long" then
-         ([long($a5; "5-hour limit"), long($a7; "Weekly limit"),
+         ([long5($a5), long($a7; "Weekly limit"),
            ($as[] | long(.; "\(.name) \(if .len == 18000 then "5-hour" else "weekly" end) limit")),
            long($asp; "Spend limit")] | join(" "))
          + (if $topinfo == null then ""
             else " Top \(if $by_fable then "Fable spender" else "spender" end): \($topinfo.label)"
                  + " (\($topinfo.share)% of recent \(if $by_fable then "Fable " else "" end)spending)." end)
        else
-         ([short($a5; "5h"), short($a7; "7d"), ($as[] | short(.; .name)), short($asp; "spend")] | join(" · "))
+         ([short5($a5), short($a7; "7d"), ($as[] | short(.; .name)), short($asp; "spend")] | join(" · "))
          + (if $topinfo == null then ""
             else " · " + c("2") + (if $by_fable then "top Fable:" else "top:" end) + c("0")
                  + " \($topinfo.label) \($topinfo.share)%" end)
@@ -534,6 +587,7 @@ render() {
     } < <(printf '%s' "$input" | jq -r --argjson now "$now" --arg samples "$samples_tail" \
             --arg scoped "$scoped_tail" --arg fleet "$fleet_text" --arg account "$account_text" \
             --arg style "$style" --arg top "$top_mode" --arg color "$color" --arg acct_on "$account_on" \
+            --arg countdown "$countdown" --argjson yellow_at "$yellow_at" --argjson red_at "$red_at" \
             --argjson acct_attempt "$account_attempt" --argjson acct_every "$account_every" \
             --argjson acct_max_age "$ACCOUNT_MAX_AGE" --argjson every "$FLEET_EVERY" \
             --argjson max_age "$FLEET_MAX_AGE" "$_render" 2>/dev/null)

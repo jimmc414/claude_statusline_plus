@@ -3,8 +3,8 @@
 Claude Code status line segments that show what the CLI knows but does not display: whether your prompt cache is still warm, and whether your usage limits will last until they reset.
 
 ```
-cache warm 31m · 5h 12% · 7d 41% · Fable 50%
-cache warm 31m · 5h 53% 3.9× cap 15:36 (resets 19:20) · 7d 38% · Fable 50% · top: refactor auth 57%
+cache warm 31m · 5h 12% (resets in 3h00m) · 7d 41% · Fable 50%
+cache warm 31m · 5h 53% 3.9× cap 15:36 (resets in 4h20m) · 7d 38% · Fable 50% · top: refactor auth 57%
 ```
 
 | Segment | The question it answers |
@@ -36,15 +36,16 @@ cache warm 3m (5m ttl)  you are on the 5-minute window, not the 1-hour one
 cache off               the API is not reporting any prompt caching
 ```
 
-**`usage_forecast.sh`** turns each limit's percentage into a pace and a forecast. Pace is your burn rate as a multiple of the rate that would use exactly 100% over a full window: `1.0×` lasts the window, `4.0×` empties it in a quarter of it. When the current pace runs the limit out before it resets, the segment turns red and says when. While a limit is heading for that, it also names the session doing most of the spending, read from the transcripts Claude Code keeps on disk. It also shows limits scoped to one model, such as the weekly Fable allowance, which it reads from the same account endpoint as the `/usage` screen.
+**`usage_forecast.sh`** turns each limit's percentage into a pace and a forecast. Pace is your burn rate as a multiple of the rate that would use exactly 100% over a full window: `1.0×` lasts the window, `4.0×` empties it in a quarter of it. When the current pace runs the limit out before it resets, the segment turns red and says when. While a limit is heading for that, it also names the session doing most of the spending, read from the transcripts Claude Code keeps on disk. It also shows limits scoped to one model, such as the weekly Fable allowance, which it reads from the same account endpoint as the `/usage` screen. The 5-hour limit also counts down to its reset, and its percentage is green, turning yellow at 75% and red at 90%, the level where Claude Code shows its own 5-hour warning.
 
 ```
-5h 12% · 7d 41% · Fable 50%              on track
-5h 20% 1.2×                              (yellow) burning faster than the window lasts, but it will last
+5h 12% (resets in 3h00m) · 7d 41% · Fable 50%     on track
+5h 20% 1.2× (resets in 2h00m)                     (yellow pace) burning faster than the window lasts, but it will last
+5h 80% (resets in 52m)                            (yellow percentage) past 75% of the 5-hour limit
 Fable 78% 1.3× cap Tue 19:58 (resets Thu 14:20)   (red) the Fable allowance runs out first
-5h 53% 3.9× cap 15:36 (resets 19:20)     (red) at this pace the limit runs out at 15:36
-5h 100% capped (resets 19:20)            (red) used up until 19:20
-... · top: refactor auth 57%             that session did 57% of the recent spending
+5h 53% 3.9× cap 15:36 (resets in 4h20m)           (red) at this pace the limit runs out at 15:36
+5h 100% capped (resets in 2h00m)                  (red) used up until the reset
+... · top: refactor auth 57%                      that session did 57% of the recent spending
 ```
 
 Knowing the state changes what you do:
@@ -117,7 +118,7 @@ echo '{"prompt_cache":{"caching_observed":true,"ttl":"1h","expires_at":'$(( $(da
 now=$(date +%s)   # a throwaway cache keeps this made-up reading out of your real ones
 echo '{"rate_limits":{"five_hour":{"used_percentage":52,"resets_at":'$(( now + 15600 ))'}}}' \
   | USAGE_FORECAST_CACHE_DIR=$(mktemp -d) bash ~/.claude/usage_forecast.sh
-# 5h 52% 3.9× cap 14:37 (resets 18:20)    (40 minutes into a window; the times will be yours)
+# 5h 52% 3.9× cap 14:37 (resets in 4h20m)    (40 minutes into a window; the cap time will be yours)
 ```
 
 ## How It Works
@@ -240,7 +241,9 @@ Same contract: status line JSON on stdin, one line out, always exit 0, nothing w
 
 | Environment variable | Default | Meaning |
 |---|---|---|
-| `USAGE_FORECAST_STYLE` | `short` | `long` prints full sentences: `5-hour limit 52% used, 3.9× a sustainable pace: runs out about 15:36, resets 19:20.` |
+| `USAGE_FORECAST_STYLE` | `short` | `long` prints full sentences: `5-hour limit 52% used, 3.9× a sustainable pace: runs out about 15:36, resets in 4h20m.` |
+| `USAGE_FORECAST_COUNTDOWN` | `1` | `0` hides the countdown to the 5-hour reset |
+| `USAGE_FORECAST_LEVELS` | `75,90` | The percentages at which the 5-hour figure turns yellow, then red |
 | `USAGE_FORECAST_TOP` | `warn` | When to name the top spender: `warn` (while a limit is red), `always`, or `never` (also skips the transcript scan) |
 | `USAGE_FORECAST_WINDOW` | `1800` | Seconds of spending the top spender's share covers |
 | `USAGE_FORECAST_ACCOUNT` | `1` | `0` never reads the login or calls the usage endpoint, so no Fable limit is shown |
@@ -251,7 +254,7 @@ Same contract: status line JSON on stdin, one line out, always exit 0, nothing w
 | `USAGE_FORECAST_TAIL_BYTES` | `16777216` | Bytes read from the end of a large transcript |
 | `NO_COLOR` | unset | Disable ANSI colors |
 
-Colors: plain while on track, yellow above `1.0×`, red when the limit runs out before it resets. A `spend_limit` window (behind a Claude apps gateway) shows as `spend 62%`, yellow from 80% and red from 100%.
+Colors: the 5-hour percentage is green, turns yellow at 75% and red at 90%, and `USAGE_FORECAST_LEVELS` moves those points. The pace shows only when it is yellow or red: yellow at `1.0×` or faster while the limit still lasts until its reset, and red with the cap time when the limit runs out first. A red limit can show a pace below `1.0×` when little of it is left, as in `5h 98% 0.4× cap 19:05`. The weekly and Fable percentages stay plain unless their pace colors them. A `spend_limit` window (behind a Claude apps gateway) shows as `spend 62%`, yellow from 80% and red from 100%.
 
 Set these in the status line command, for example `"command": "USAGE_FORECAST_TOP=always bash ~/.claude/statusline_plus.sh"`.
 
@@ -317,7 +320,7 @@ tests/test_install.py          installer behavior against throwaway config direc
 
 Run the tests with `python -m pytest tests/ -q`. They need `bash`, `jq`, and `pytest`.
 
-The segments are tested through their real interface rather than by unit: every test pipes a payload, and where needed synthetic transcripts and readings, to the script and asserts on the line it prints. Both suites were hardened by mutation testing. The regression tests at the bottom of `test_cache_warm.py` each pin a bug that an earlier version of that suite missed. For `usage_forecast.sh`, 38 deliberately planted bugs were each caught before release: pricing, deduplication, the look-back, the record-only-a-new-high rule, the scan's time and file filters, and the login handling for the Fable limit. The Fable tests run against a local stand-in for the usage endpoint, never the real one.
+The segments are tested through their real interface rather than by unit: every test pipes a payload, and where needed synthetic transcripts and readings, to the script and asserts on the line it prints. Both suites were hardened by mutation testing. The regression tests at the bottom of `test_cache_warm.py` each pin a bug that an earlier version of that suite missed. For `usage_forecast.sh`, 49 deliberately planted bugs were each caught before release: pricing, deduplication, the look-back, the record-only-a-new-high rule, the scan's time and file filters, the login handling for the Fable limit, and the countdown and color thresholds. The Fable tests run against a local stand-in for the usage endpoint, never the real one.
 
 ## Limitations
 

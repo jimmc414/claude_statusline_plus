@@ -49,7 +49,7 @@ class Runner:
         # directory is a throwaway one, so no test can ever read a real login.
         full_env = {**os.environ, "NO_COLOR": "1", "TZ": "UTC", "USAGE_FORECAST_NOW": str(now),
                     "USAGE_FORECAST_CACHE_DIR": str(self.cache), "USAGE_FORECAST_PROJECTS": str(self.projects),
-                    "USAGE_FORECAST_SYNC": "1", "USAGE_FORECAST_ACCOUNT": "0",
+                    "USAGE_FORECAST_SYNC": "1", "USAGE_FORECAST_ACCOUNT": "0", "USAGE_FORECAST_COUNTDOWN": "0",
                     "CLAUDE_CONFIG_DIR": str(self.config), "CLAUDE_CODE_OAUTH_TOKEN": None,
                     "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost", **env}
         for key in [k for k, v in full_env.items() if v is None]:
@@ -105,7 +105,9 @@ def test_long_style_says_it_in_sentences(run):
 
 
 def test_running_out_is_red(run):
-    assert "\033[38;5;196m52% 3.9× cap 15:36" in run(limits(u5=52), now=S5 + 40 * 60, NO_COLOR=None)
+    # The percentage is colored by its level (52%: green); the forecast is red.
+    out = run(limits(u5=52), now=S5 + 40 * 60, NO_COLOR=None)
+    assert "\033[38;5;40m52%\033[0m \033[38;5;196m3.9× cap 15:36\033[0m" in out
 
 
 def test_average_pace_over_one_always_runs_out_first(run):
@@ -119,7 +121,7 @@ def test_burning_fast_from_a_low_base_is_yellow_without_a_cap(run):
     now = S5 + 3 * HOUR
     seed(run, (S5 + HOUR, 8, R5, None, None), (now - 5 * 60, 20, R5, None, None))
     assert run(limits(u5=20), now=now) == "5h 20% 1.2×"
-    assert "\033[38;5;220m20% 1.2×" in run(limits(u5=20), now=now, NO_COLOR=None)
+    assert "\033[38;5;40m20%\033[0m \033[38;5;220m1.2×\033[0m" in run(limits(u5=20), now=now, NO_COLOR=None)
 
 
 def test_used_up(run):
@@ -146,6 +148,65 @@ def test_spend_limit(run):
     reset = 1_790_000_000 + 10 * DAY
     assert run(limits(spend=62, spend_reset=reset), now=S5) == "spend 62%"
     assert run(limits(spend=104, spend_reset=reset), now=S5) == f"spend 104% (resets {utc(reset, '%b %d')})"
+
+
+# --- the 5-hour countdown and level colors ---------------------------------------
+
+GREEN, YELLOW, RED = "\033[38;5;40m", "\033[38;5;220m", "\033[38;5;196m"
+
+
+@pytest.mark.parametrize("u5,now,expected", [
+    (12, S5 + 2 * HOUR, "5h 12% (resets in 3h00m)"),
+    (12, S5 + 2 * HOUR - 7 * 60, "5h 12% (resets in 3h07m)"),
+    (80, R5 - 52 * 60, "5h 80% (resets in 52m)"),
+    (92, R5 - 30, "5h 92% (resets in <1m)"),
+    (52, S5 + 40 * 60, "5h 52% 3.9× cap 15:36 (resets in 4h20m)"),
+    (100, S5 + 3 * HOUR, "5h 100% capped (resets in 2h00m)"),
+])
+def test_the_five_hour_limit_counts_down_to_its_reset(run, u5, now, expected):
+    assert run(limits(u5=u5, u7=41), now=now, USAGE_FORECAST_COUNTDOWN=None) == expected + " · 7d 41%"
+
+
+def test_a_fast_five_hour_pace_keeps_its_countdown(run):
+    now = S5 + 3 * HOUR
+    seed(run, (S5 + HOUR, 8, R5, None, None), (now - 5 * 60, 20, R5, None, None))
+    assert run(limits(u5=20), now=now, USAGE_FORECAST_COUNTDOWN=None) == "5h 20% 1.2× (resets in 2h00m)"
+
+
+def test_long_style_counts_down_too(run):
+    assert run(limits(u5=12), now=S5 + 2 * HOUR, USAGE_FORECAST_COUNTDOWN=None,
+               USAGE_FORECAST_STYLE="long") == "5-hour limit 12% used, resets in 3h00m."
+    assert run(limits(u5=52), now=S5 + 40 * 60, USAGE_FORECAST_COUNTDOWN=None, USAGE_FORECAST_STYLE="long") == (
+        "5-hour limit 52% used, 3.9× a sustainable pace: runs out about 15:36, resets in 4h20m.")
+
+
+def test_the_countdown_can_be_turned_off(run):
+    assert run(limits(u5=12), now=S5 + 2 * HOUR, USAGE_FORECAST_COUNTDOWN="0") == "5h 12%"
+
+
+@pytest.mark.parametrize("u5,color", [(12, GREEN), (74, GREEN), (75, YELLOW), (89, YELLOW), (90, RED), (97, RED)])
+def test_the_five_hour_percentage_turns_yellow_then_red(run, u5, color):
+    # Late in the window, so none of these is burning fast enough to add a forecast.
+    out = run(limits(u5=u5), now=R5 - 10 * 60, NO_COLOR=None)
+    assert f"{color}{u5}%\033[0m" in out
+
+
+def test_the_color_levels_can_be_tuned(run):
+    out = run(limits(u5=60), now=R5 - 10 * 60, NO_COLOR=None, USAGE_FORECAST_LEVELS="50,80")
+    assert f"{YELLOW}60%" in out
+
+
+@pytest.mark.parametrize("levels", ["90,75", "abc", "0,50", "75,200", "75"])
+def test_unusable_color_levels_fall_back_to_75_and_90(run, levels):
+    out = run(limits(u5=80), now=R5 - 10 * 60, NO_COLOR=None, USAGE_FORECAST_LEVELS=levels)
+    assert f"{YELLOW}80%" in out
+
+
+def test_the_weekly_limit_is_not_colored_by_level(run):
+    # 80% an hour before the weekly reset is on track: no forecast color, and no
+    # level color either, since only the 5-hour percentage gets those.
+    out = run(limits(u7=80), now=R7 - HOUR, NO_COLOR=None)
+    assert out == "\033[2m7d\033[0m 80%"
 
 
 # --- where the rate comes from ------------------------------------------------

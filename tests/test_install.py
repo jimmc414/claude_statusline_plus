@@ -73,8 +73,8 @@ def test_configured_command_joins_both_segments(cfg, tmp_path):
     run_installer(cfg)
     now = int(time.time())
     payload = {"prompt_cache": {"caching_observed": True, "ttl": "1h", "expires_at": now + 1860},
-               "rate_limits": {"five_hour": {"used_percentage": 12, "resets_at": now + 4 * 3600}}}
-    assert run_status_line(cfg, payload, tmp_path) == "cache warm 31m · 5h 12%"
+               "rate_limits": {"five_hour": {"used_percentage": 12, "resets_at": now + 4 * 3600 + 30}}}
+    assert run_status_line(cfg, payload, tmp_path) == "cache warm 31m · 5h 12% (resets in 4h00m)"
 
 
 def test_configured_command_prints_nothing_before_the_first_response(cfg, tmp_path):
