@@ -177,6 +177,15 @@ The meter belongs to the account, so every session on the machine records into t
 
 The file keeps its last thousand readings, a few days of history.
 
+#### After a reset
+
+Claude Code sends the status line a limit only while a window is running for it. Once a limit's reset time passes, Claude Code drops it until a response brings the next window, so a session that sits idle across a reset would lose the item. The segment keeps every limit on screen:
+
+- **A limit at 0% shows as 0%**, as in `5h 0%`, `7d 0%` or `Fable 0%`.
+- **A 5-hour or weekly limit missing from the payload** comes from the newest window another session has recorded, else from the account fetch. If neither knows of a new window, it shows at 0% with no countdown, because no window is running yet.
+- **A Fable limit whose reset has passed** since the last fetch shows 0% until the next fetch.
+- **Nothing is invented.** Only limits this machine has already seen are filled in this way.
+
 #### Limits scoped to one model
 
 Claude Code's status line payload carries only the 5-hour and weekly limits. The weekly Fable allowance, and any other limit scoped to one model, is listed only by the account endpoint behind the `/usage` screen, `https://api.anthropic.com/api/oauth/usage`, in its `limits` list, where a scoped entry names its model in `scope`. The segment fetches it itself:
@@ -322,7 +331,7 @@ tests/test_install.py          installer behavior against throwaway config direc
 
 Run the tests with `python -m pytest tests/ -q`. They need `bash`, `jq`, and `pytest`.
 
-The segments are tested through their real interface rather than by unit: every test pipes a payload, and where needed synthetic transcripts and readings, to the script and asserts on the line it prints. Both suites were hardened by mutation testing. The regression tests at the bottom of `test_cache_warm.py` each pin a bug that an earlier version of that suite missed. For `usage_forecast.sh`, 49 deliberately planted bugs were each caught before release: pricing, deduplication, the look-back, the record-only-a-new-high rule, the scan's time and file filters, the login handling for the Fable limit, and the countdown and color thresholds. The Fable tests run against a local stand-in for the usage endpoint, never the real one.
+The segments are tested through their real interface rather than by unit: every test pipes a payload, and where needed synthetic transcripts and readings, to the script and asserts on the line it prints. Both suites were hardened by mutation testing. The regression tests at the bottom of `test_cache_warm.py` each pin a bug that an earlier version of that suite missed. For `usage_forecast.sh`, 59 deliberately planted bugs were each caught before release: pricing, deduplication, the look-back, the record-only-a-new-high rule, the scan's time and file filters, the login handling for the Fable limit, the countdown and color thresholds, and the 0% fallbacks after a reset. The Fable tests run against a local stand-in for the usage endpoint, never the real one.
 
 ## Limitations
 

@@ -9,6 +9,10 @@
 #     5h 53% 3.9× cap 15:36 (resets in 4h20m)                (red) at this pace the limit runs out first
 #     ... · top: refactor auth 57%                           the session doing most of the burning
 #
+# A limit never disappears at 0%. After a reset, Claude Code drops the window
+# until a response brings the next one; the segment then shows the newest
+# window another session recorded, or the account fetch, or 0%.
+#
 # The 5-hour limit always shows a countdown to its reset, and its percentage is
 # green, then yellow from 75% and red from 90%, the level where Claude Code
 # itself warns. The pace and cap time keep their own colors.
@@ -263,7 +267,10 @@ token_of() {
 
 # The endpoint lists every limit under .limits; the scoped ones name a model (or
 # a surface) in .scope. Reset times arrive as ISO strings with microseconds that
-# jitter between fetches, so they are rounded to the minute.
+# jitter between fetches, so they are rounded to the minute; a limit with no
+# window running reports no reset time, recorded as 0. The plain 5-hour and
+# weekly figures are kept too, as @5h and @7d, for a status line whose payload
+# has dropped them.
 _account='
 def epoch:
   capture("^(?<b>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\\.[0-9]+)?(?<z>Z|[+-][0-9]{2}:[0-9]{2})$") as $m
@@ -273,17 +280,18 @@ def epoch:
             * (if $m.z[0:1] == "-" then -1 else 1 end) end);
 def scopename: [.scope | objects | (.model, .surface) | objects | .display_name | strings
                 | gsub("[[:cntrl:]]"; "") | select(length > 0)] | first;
+def resetof: ((.resets_at | strings | try epoch catch null) // null)
+  | if . == null then 0 else ((. + 30) / 60 | floor) * 60 end;
 [ .limits[]? | objects
   | scopename as $name | select($name != null)
   | (.percent | numbers) as $u
-  | ((.resets_at | strings | try epoch catch null) // null) as $r
-  | select($r != null)
-  | {name: $name[0:16], u: $u, r: ((($r + 30) / 60 | floor) * 60),
-     len: (if .group == "session" then 18000 else 604800 end)} ] as $limits
+  | {name: $name[0:16], u: $u, r: resetof, len: (if .group == "session" then 18000 else 604800 end)} ] as $limits
+| [ (.five_hour | objects | {name: "@5h", u: (.utilization | numbers), r: resetof, len: 18000}),
+    (.seven_day | objects | {name: "@7d", u: (.utilization | numbers), r: resetof, len: 604800}) ] as $plain
 | [ $samples | split("\n")[] | split("\t") | select(length == 4)
     | [(.[0] | tonumber? // null), .[1], (.[2] | tonumber? // null), (.[3] | tonumber? // null)] ] as $seen
-| ($limits[] | "W\t\(.name)\t\(.u)\t\(.r)\t\(.len)"),
-  ($limits[] | . as $l
+| ($limits[], $plain[] | "W\t\(.name)\t\(.u)\t\(.r)\t\(.len)"),
+  ($limits[] | select(.r > 0) | . as $l
    | ([$seen[] | select(.[1] == $l.name and .[3] == $l.r) | .[2] | numbers] | max) as $max
    | select($max == null or $l.u > $max)
    | "S\t\($now)\t\($l.name)\t\($l.u)\t\($l.r)")'
@@ -357,6 +365,29 @@ def win($o; $len):
       else {u: $u, r: ($r | floor), len: $len} end
   end;
 
+# A limit from the account fetch. With no reset time, no window is running: show
+# its percentage as it is. With a reset that has passed since the fetch, the
+# limit has restarted at 0.
+def fetched($s):
+  if ($s.u | num) == null or $s.u < 0 or $s.u > 1000 then null
+  elif $s.r == 0 then {u: $s.u, r: 0, len: $s.len}
+  elif $s.r <= $now then {u: 0, r: 0, len: $s.len}
+  elif $s.r > $now + $s.len + 3600 then null
+  else {u: $s.u, r: $s.r, len: $s.len} end;
+
+# A 5-hour or weekly limit missing from the payload: the newest window still
+# running that any session recorded, else the account fetch, else 0%. Only for
+# a limit known to exist, from a reading or a fetch: nothing is invented.
+def gap($rows; $ui; $ri; $len; $fetch):
+  [$rows[] | select((.[$ri] | numbers) != null and (.[$ui] | numbers) != null)] as $seen
+  | [$seen[] | select(.[$ri] > $now and .[$ri] <= $now + $len + 3600)] as $cur
+  | if ($cur | length) > 0 then
+      ($cur | map(.[$ri]) | max) as $r
+      | {u: ([$cur[] | select(.[$ri] == $r) | .[$ui]] | max), r: $r, len: $len}
+    elif $fetch != null then (fetched($fetch) // {u: 0, r: 0, len: $len})
+    elif ($seen | length) > 0 then {u: 0, r: 0, len: $len}
+    else null end;
+
 # 5-hour and weekly readings: epoch, 5h used, 5h reset, 7d used, 7d reset.
 def rows: [ $samples | split("\n")[] | split("\t") | select(length == 5)
             | map(if . == "-" or . == "" then null else (tonumber? // null) end)
@@ -381,6 +412,11 @@ def analyze($w; $ws):
   elif $w.len == 0 then
     {u: $w.u, r: $w.r, len: 0, pace: null, eta: null, capped: ($w.u >= 100),
      red: ($w.u >= 100), yellow: ($w.u >= 80)}
+  elif $w.r == 0 then
+    # No window running (a reset has passed and nothing is known since): no pace,
+    # no forecast, no countdown.
+    {u: $w.u, r: 0, len: $w.len, pace: null, eta: null, capped: ($w.u >= 100),
+     red: ($w.u >= 100), yellow: false}
   else
     ([$w.u, ([$ws[] | .[1]] | max // 0)] | max) as $u
     | $w.len as $L
@@ -408,7 +444,7 @@ def analyze($w; $ws):
 def short($a; $label):
   if $a == null then empty else
     (c("2") + $label + c("0") + " ") as $head
-    | (c("2") + " (resets " + ($a.r | at($a.len)) + ")" + c("0")) as $resets
+    | (if $a.r > 0 then c("2") + " (resets " + ($a.r | at($a.len)) + ")" + c("0") else "" end) as $resets
     | if $a.len == 0 then
         $head + (if $a.red then c("38;5;196") elif $a.yellow then c("38;5;220") else "" end)
         + ((($a.u + 0.5) | floor | tostring) + "%") + (if $a.red or $a.yellow then c("0") else "" end)
@@ -428,7 +464,8 @@ def long($a; $name):
     + "\($name) \((($a.u + 0.5) | floor))% used"
     + (if $a.red then ", resets \($a.r | at(0))." else "." end)
     + (if $a.red or $a.yellow then c("0") else "" end)
-  elif $a.capped then c("38;5;196") + "\($name) used up, resets \($a.r | at($a.len))." + c("0")
+  elif $a.capped then
+    c("38;5;196") + "\($name) used up" + (if $a.r > 0 then ", resets \($a.r | at($a.len))" else "" end) + "." + c("0")
   elif $a.red then
     c("38;5;196") + "\($name) \($a.u | pct) used, \($a.pace | x) a sustainable pace: runs out about "
     + "\($a.eta | at($a.len)), resets \($a.r | at($a.len))." + c("0")
@@ -447,7 +484,8 @@ def level($u): if $u >= $red_at then c("38;5;196") elif $u >= $yellow_at then c(
 def short5($a):
   if $a == null then empty else
     (c("2") + "5h" + c("0") + " ") as $head
-    | (if cd then " (resets in " + (($a.r - $now) | dur) + ")"
+    | (if $a.r == 0 then ""
+       elif cd then " (resets in " + (($a.r - $now) | dur) + ")"
        else c("2") + " (resets " + ($a.r | at($a.len)) + ")" + c("0") end) as $resets
     | if $a.capped then $head + c("38;5;196") + "100% capped" + c("0") + $resets
       else
@@ -461,41 +499,56 @@ def short5($a):
 
 def long5($a):
   if $a == null then empty else
-    (if cd then "resets in " + (($a.r - $now) | dur) else "resets " + ($a.r | at($a.len)) end) as $rs
+    (if $a.r == 0 then ""
+     elif cd then ", resets in " + (($a.r - $now) | dur)
+     elif $a.red or $a.capped then ", resets " + ($a.r | at($a.len))
+     else "" end) as $rs
     | (if $a.red or $a.u >= $red_at then c("38;5;196")
        elif $a.yellow or $a.u >= $yellow_at then c("38;5;220") else c("38;5;40") end)
-    + (if $a.capped then "5-hour limit used up, \($rs)."
+    + (if $a.capped then "5-hour limit used up\($rs)."
        elif $a.red then "5-hour limit \($a.u | pct) used, \($a.pace | x) a sustainable pace: runs out about "
-                        + "\($a.eta | at($a.len)), \($rs)."
-       elif $a.yellow then "5-hour limit \($a.u | pct) used, \($a.pace | x) a sustainable pace"
-                           + (if cd then ", \($rs)." else "." end)
-       else "5-hour limit \($a.u | pct) used" + (if cd then ", \($rs)." else "." end) end)
+                        + "\($a.eta | at($a.len))\($rs)."
+       elif $a.yellow then "5-hour limit \($a.u | pct) used, \($a.pace | x) a sustainable pace\($rs)."
+       else "5-hour limit \($a.u | pct) used\($rs)." end)
     + c("0")
   end;
 
 (if type == "object" then . else {} end) as $p
 | (($p.rate_limits | objects) // {}) as $rl
-| win($rl.five_hour; 18000) as $w5
-| win($rl.seven_day; 604800) as $w7
+| win($rl.five_hour; 18000) as $p5
+| win($rl.seven_day; 604800) as $p7
 | win($rl.spend_limit; 0) as $wsp
+| ($p5 != null or $p7 != null) as $sub   # a Claude subscription session
 
-# Scoped limits from the last account fetch, if recent enough to trust. They
-# belong to the Claude login, so they only show beside the 5-hour or weekly
-# limits in the payload: an API-key or gateway session does not draw on them.
+# The last account fetch, if recent enough to trust. Its limits belong to the
+# Claude login, so they only count in a subscription session: an API-key or
+# gateway session does not draw on them.
 | ($account | split("\n")) as $al
 | (($al[0] // "") | split("\t")) as $ah
 | (if ($ah | length) >= 2 and $ah[0] == "#" then ($ah[1] | tonumber? // null) else null end) as $aat
-| (if ($w5 != null or $w7 != null) and $aat != null and ($now - $aat) <= $acct_max_age then
+| (if $sub and $aat != null and ($now - $aat) <= $acct_max_age then
      [ $al[1:][] | split("\t") | select(length == 4)
        | {name: (.[0] | clean | trunc(16)), u: (.[1] | tonumber? // null),
           r: (.[2] | tonumber? // null), len: (.[3] | tonumber? // null)}
-       | select(.name != "" and (.len == 18000 or .len == 604800)) as $s
-       | win({used_percentage: $s.u, resets_at: $s.r}; $s.len) | select(. != null) | . + {name: $s.name} ]
-   else [] end) as $sw
+       | select(.name != "" and .r != null and (.len == 18000 or .len == 604800)) ]
+   else [] end) as $acct
+| [ $acct[] | select(.name | startswith("@") | not) | . as $s | fetched($s) | select(. != null)
+    | . + {name: $s.name} ] as $sw
+
+# Claude Code drops a window from the payload once its reset passes, and sends
+# the next one only after a response carries it. Until then the limit still
+# shows: from a newer window another session recorded, else from the account
+# fetch, else at 0%.
+| rows as $rows
+| (if $p5 != null then $p5
+   elif $sub then gap($rows; 1; 2; 18000; ([$acct[] | select(.name == "@5h")] | first))
+   else null end) as $w5
+| (if $p7 != null then $p7
+   elif $sub then gap($rows; 3; 4; 604800; ([$acct[] | select(.name == "@7d")] | first))
+   else null end) as $w7
 
 | if $w5 == null and $w7 == null and $wsp == null then "", "", "" else
-    rows as $rows
-    | srows as $srows
+    srows as $srows
     | analyze($w5; pairs($rows; 1; 2; $w5)) as $a5
     | analyze($w7; pairs($rows; 3; 4; $w7)) as $a7
     | analyze($wsp; []) as $asp
@@ -509,11 +562,11 @@ def long5($a):
     | ($as | map(select(.name | ascii_downcase | test("fable"))) | any(.red)) as $red_fable
 
     # Record this reading when it raises the known maximum for its window.
-    | newer($w5; 1; 2; $rows) as $n5
-    | newer($w7; 3; 4; $rows) as $n7
+    | newer($p5; 1; 2; $rows) as $n5
+    | newer($p7; 3; 4; $rows) as $n7
     | (if $n5 or $n7 then
-         [$now, (if $n5 then $w5.u else "-" end), (if $n5 then $w5.r else "-" end),
-                (if $n7 then $w7.u else "-" end), (if $n7 then $w7.r else "-" end)]
+         [$now, (if $n5 then $p5.u else "-" end), (if $n5 then $p5.r else "-" end),
+                (if $n7 then $p7.u else "-" end), (if $n7 then $p7.r else "-" end)]
          | map(tostring) | join("\t")
        else "" end) as $append
 
@@ -542,7 +595,7 @@ def long5($a):
 
     | ([ (if ($top == "always" or ($top == "warn" and ($red or $yellow)))
              and ($at == null or ($now - $at) >= $every) then "fleet" else empty end),
-         (if $acct_on == "1" and ($w5 != null or $w7 != null) and ($now - $acct_attempt) >= $acct_every
+         (if $acct_on == "1" and $sub and ($now - $acct_attempt) >= $acct_every
           then "account" else empty end) ] | join(" ")) as $jobs
 
     | (if $style == "long" then

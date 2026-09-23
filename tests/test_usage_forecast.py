@@ -703,14 +703,15 @@ def test_a_garbage_reply_is_ignored(run, usage_api, body):
     assert run(limits(u5=12, u7=41), now=AT, **with_account(usage_api)) == "5h 12% · 7d 41%"
 
 
-def test_a_scoped_limit_needs_a_name_and_a_reset(run, usage_api):
+def test_a_scoped_limit_needs_a_name(run, usage_api):
     login(run, AT)
     nameless = {"kind": "weekly_scoped", "group": "weekly", "percent": 90, "resets_at": endpoint_time(R7),
                 "scope": {"model": {"id": None, "display_name": None}, "surface": None}}
     no_reset = {"kind": "weekly_scoped", "group": "weekly", "percent": 90, "resets_at": None,
                 "scope": {"model": {"display_name": "Sonnet"}}}
     usage_api.reply = usage_reply(fable=50, extra=[nameless, no_reset])
-    assert run(limits(u5=12, u7=41), now=AT, **with_account(usage_api)) == "5h 12% · 7d 41% · Fable 50%"
+    # No reset time means no window is running: the percentage shows as it is.
+    assert run(limits(u5=12, u7=41), now=AT, **with_account(usage_api)) == "5h 12% · 7d 41% · Fable 50% · Sonnet 90%"
 
 
 def test_other_scoped_limits_are_shown_by_their_name(run, usage_api):
@@ -738,3 +739,84 @@ def test_when_the_five_hour_limit_runs_out_too_all_spending_counts(run, usage_ap
     transcript(run, SID_B, [title("b"), call(AT - 60, "m2", model="claude-fable-5-1", out=100_000)])
     out = run({**limits(u5=90, u7=41), "session_id": SID_B}, now=AT, **with_account(usage_api))
     assert out.endswith(" · top: a 80%")
+
+
+# =============================================================================
+# 0%, and limits Claude Code has dropped after a reset
+# =============================================================================
+
+def test_a_limit_at_zero_shows_as_zero(run):
+    assert run(limits(u5=0, u7=0), now=S5 + 60) == "5h 0% · 7d 0%"
+    assert run(limits(u5=0, u7=0), now=S5 + 60, USAGE_FORECAST_COUNTDOWN=None) == "5h 0% (resets in 4h59m) · 7d 0%"
+
+
+def test_a_five_hour_limit_dropped_after_its_reset_shows_zero(run):
+    # The old window is on record and its reset has passed. The payload carries
+    # only the weekly limit, as Claude Code sends it until a response brings the
+    # new window. There is no window yet, so no countdown.
+    seed(run, (R5 - 600, 88, R5, 41, R7))
+    assert run(limits(u7=41), now=R5 + 60, USAGE_FORECAST_COUNTDOWN=None) == "5h 0% · 7d 41%"
+
+
+def test_a_new_window_another_session_saw_fills_the_gap(run):
+    seed(run, (R5 - 600, 88, R5, 41, R7), (R5 + 120, 1, R5 + FIVE_H, None, None))
+    assert run(limits(u7=41), now=R5 + 180, USAGE_FORECAST_COUNTDOWN=None) == "5h 1% (resets in 4h57m) · 7d 41%"
+
+
+def test_the_account_fetch_fills_the_gap(run):
+    seed(run, (R5 - 600, 88, R5, 41, R7))
+    run.cache.mkdir(parents=True, exist_ok=True)
+    (run.cache / "account.tsv").write_text(f"#\t{R5 + 60}\n@5h\t3\t{R5 + FIVE_H - 60}\t{FIVE_H}\n")
+    out = run(limits(u7=41), now=R5 + 120, USAGE_FORECAST_COUNTDOWN=None, USAGE_FORECAST_ACCOUNT="1",
+              USAGE_FORECAST_ACCOUNT_URL="http://127.0.0.1:9/unused")
+    assert out == "5h 3% (resets in 4h57m) · 7d 41%"
+
+
+def test_a_fetch_from_before_the_reset_reads_zero(run):
+    seed(run, (R5 - 600, 88, R5, 41, R7))
+    run.cache.mkdir(parents=True, exist_ok=True)
+    (run.cache / "account.tsv").write_text(f"#\t{R5 - 60}\n@5h\t88\t{R5}\t{FIVE_H}\n")
+    out = run(limits(u7=41), now=R5 + 120, USAGE_FORECAST_ACCOUNT="1", USAGE_FORECAST_ACCOUNT_URL="http://127.0.0.1:9/unused")
+    assert out == "5h 0% · 7d 41%"
+
+
+def test_a_weekly_limit_dropped_after_its_reset_shows_zero(run):
+    seed(run, (R7 - 600, None, None, 97, R7))
+    assert run(limits(u5=12, r5=R7 + 3 * HOUR), now=R7 + 60) == "5h 12% · 7d 0%"
+
+
+def test_a_limit_never_seen_is_not_invented(run):
+    assert run(limits(u5=12), now=S5 + 2 * HOUR) == "5h 12%"
+
+
+def test_no_zero_fill_outside_a_subscription_session(run):
+    seed(run, (R5 - 600, 88, R5, 41, R7))
+    assert run(limits(spend=62, spend_reset=R5 + 10 * DAY), now=R5 + 60) == "spend 62%"
+
+
+def test_fable_at_zero_with_no_window_shows_zero(run, usage_api):
+    login(run, AT)
+    no_window = {"kind": "weekly_scoped", "group": "weekly", "percent": 0, "resets_at": None,
+                 "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None}}
+    usage_api.reply = usage_reply(extra=[no_window])
+    assert run(limits(u5=12, u7=41), now=AT, **with_account(usage_api)) == "5h 12% · 7d 41% · Fable 0%"
+
+
+def test_fable_restarts_at_zero_when_its_reset_passes(run, usage_api):
+    # Fetched a minute before the weekly reset; rendered two minutes after it,
+    # before the next fetch is due.
+    login(run, R7 - 60, expires_in=DAY)
+    usage_api.reply = usage_reply(fable=81)
+    payload = limits(u5=12, u7=1, r5=R7 + 3 * HOUR, r7=R7 + WEEK)
+    assert run(payload, now=R7 - 60, **with_account(usage_api)).endswith("Fable 81%")
+    assert run(payload, now=R7 + 120, **with_account(usage_api)).endswith("Fable 0%")
+    assert len(usage_api.requests) == 1
+
+
+def test_the_endpoints_own_five_hour_and_weekly_never_show_as_scoped_limits(run, usage_api):
+    login(run, AT)
+    usage_api.reply = usage_reply(fable=50)
+    run(limits(u5=12, u7=41), now=AT, **with_account(usage_api))
+    rows = (run.cache / "account.tsv").read_text()
+    assert "@5h\t" in rows
+    assert "@" not in run(limits(u5=12, u7=41), now=AT + 30, **with_account(usage_api))
