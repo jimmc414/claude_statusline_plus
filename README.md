@@ -3,14 +3,14 @@
 Claude Code status line segments that show what the CLI knows but does not display: whether your prompt cache is still warm, and whether your usage limits will last until they reset.
 
 ```
-cache warm 31m · 5h 12% · 7d 41%
-cache warm 31m · 5h 53% 3.9× cap 15:36 (resets 19:20) · 7d 38% · top: refactor auth 57%
+cache warm 31m · 5h 12% · 7d 41% · Fable 50%
+cache warm 31m · 5h 53% 3.9× cap 15:36 (resets 19:20) · 7d 38% · Fable 50% · top: refactor auth 57%
 ```
 
 | Segment | The question it answers |
 |---|---|
 | `cache_warm.sh` | Is the prompt cache still warm, and what will a cold start cost? |
-| `usage_forecast.sh` | At this pace, will my 5-hour and weekly limits last until they reset, and which session is burning them? |
+| `usage_forecast.sh` | At this pace, will my 5-hour, weekly and Fable limits last until they reset, and which session is burning them? |
 | `statusline_plus.sh` | Runs both and joins what they print. The installer uses it when you have no status line of your own. |
 
 Each segment is a standalone script with the same contract: status line JSON on stdin, one line on stdout, nothing at all when there is nothing to report, and always exit 0.
@@ -19,7 +19,7 @@ Each segment is a standalone script with the same contract: status line JSON on 
 
 **The prompt cache.** Every request Claude Code sends includes the entire conversation so far. Prompt caching makes that affordable: a cached prefix is read at a fraction of the normal input price. But the cache expires after a period of inactivity, and nothing in the terminal tells you when. So you step away from a 300k-token session, come back 65 minutes later, type "ok, continue", and that one short message re-processes all 300k tokens at full price. On a subscription that is a visible bite out of your usage window. The expiry is invisible, and the cost lands on whichever message happens to come next.
 
-**The usage limits.** A Claude subscription meters usage in a rolling 5-hour window and a weekly one. Claude Code hands the status line both percentages, but a percentage alone does not say whether you will make it. 53% is comfortable three hours into a window and a lockout forty minutes in. And the meter is account-wide: with several sessions, subagents, or workflows running, nothing tells you which one is burning it.
+**The usage limits.** A Claude subscription meters usage in a rolling 5-hour window and a weekly one. Claude Code hands the status line both percentages, but a percentage alone does not say whether you will make it. 53% is comfortable three hours into a window and a lockout forty minutes in. And the meter is account-wide: with several sessions, subagents, or workflows running, nothing tells you which one is burning it. Fable also has a weekly allowance of its own, which Claude Code never passes to the status line at all.
 
 The information needed to act on both exists. It just is not displayed anywhere in the CLI.
 
@@ -36,11 +36,12 @@ cache warm 3m (5m ttl)  you are on the 5-minute window, not the 1-hour one
 cache off               the API is not reporting any prompt caching
 ```
 
-**`usage_forecast.sh`** turns each limit's percentage into a pace and a forecast. Pace is your burn rate as a multiple of the rate that would use exactly 100% over a full window: `1.0×` lasts the window, `4.0×` empties it in a quarter of it. When the current pace runs the limit out before it resets, the segment turns red and says when. While a limit is heading for that, it also names the session doing most of the spending, read from the transcripts Claude Code keeps on disk.
+**`usage_forecast.sh`** turns each limit's percentage into a pace and a forecast. Pace is your burn rate as a multiple of the rate that would use exactly 100% over a full window: `1.0×` lasts the window, `4.0×` empties it in a quarter of it. When the current pace runs the limit out before it resets, the segment turns red and says when. While a limit is heading for that, it also names the session doing most of the spending, read from the transcripts Claude Code keeps on disk. It also shows limits scoped to one model, such as the weekly Fable allowance, which it reads from the same account endpoint as the `/usage` screen.
 
 ```
-5h 12% · 7d 41%                          on track
+5h 12% · 7d 41% · Fable 50%              on track
 5h 20% 1.2×                              (yellow) burning faster than the window lasts, but it will last
+Fable 78% 1.3× cap Tue 19:58 (resets Thu 14:20)   (red) the Fable allowance runs out first
 5h 53% 3.9× cap 15:36 (resets 19:20)     (red) at this pace the limit runs out at 15:36
 5h 100% capped (resets 19:20)            (red) used up until 19:20
 ... · top: refactor auth 57%             that session did 57% of the recent spending
@@ -100,7 +101,7 @@ curl -fsSL https://raw.githubusercontent.com/jimmc414/claude_statusline_plus/mai
 ./install.sh --uninstall --project ~/code/myapp
 ```
 
-Removes the three scripts, and removes the `statusLine` entry only if it is one this installer wrote. `usage_forecast.sh` keeps its readings in `~/.cache/claude-statusline-plus`; delete that directory too if you want no trace.
+Removes the three scripts, and removes the `statusLine` entry only if it is one this installer wrote. `usage_forecast.sh` keeps its readings and fetched limits in `~/.cache/claude-statusline-plus`; delete that directory too if you want no trace.
 
 ## Usage
 
@@ -160,6 +161,8 @@ The payload's `rate_limits` object gives each window's used percentage and reset
 1. **Recent readings.** Whenever a status line render sees a window's percentage rise above the highest value recorded for it, the segment appends a reading to `~/.cache/claude-statusline-plus/usage_samples.tsv`. The rate is the rise over the last 30 minutes for the 5-hour window, or 6 hours for the weekly one.
 2. **The window average,** when there are not yet enough readings: the percentage used divided by the time since the window opened. It is not used in a window's first 5% (15 minutes of a 5-hour window), where a single burst would read as an enormous pace.
 
+The meter reports whole percentages, so a pace built on little history is coarse. On the weekly window one point is 1.7 hours at `1.0×`, so a single point in the first hour after installing reads as about `1.6×`. The figure steadies as the look-back fills.
+
 The cap time is when the used percentage reaches 100% at that rate. The segment turns red when that falls before the reset, and yellow when the pace is at least `1.0×` but the reset comes first. A pace from the window average can never be yellow: at `1.0×` or more over the whole window so far, the rest of the window runs out too.
 
 #### Readings are shared across sessions
@@ -170,6 +173,18 @@ The meter belongs to the account, so every session on the machine records into t
 - **The freshest value wins.** An idle session displays the highest reading any session has seen for the window, not its own stale one.
 
 The file keeps its last thousand readings, a few days of history.
+
+#### Limits scoped to one model
+
+Claude Code's status line payload carries only the 5-hour and weekly limits. The weekly Fable allowance, and any other limit scoped to one model, is listed only by the account endpoint behind the `/usage` screen, `https://api.anthropic.com/api/oauth/usage`, in its `limits` list, where a scoped entry names its model in `scope`. The segment fetches it itself:
+
+- **With your Claude Code login, read-only.** The access token comes from `~/.claude/.credentials.json`, or `CLAUDE_CODE_OAUTH_TOKEN` when that is set. It is never refreshed, because refreshing could sign Claude Code itself out; an expired token is skipped until Claude Code renews it. It is never written anywhere, and it reaches `curl` on stdin, so it never shows in a process list.
+- **In the background, at most every 5 minutes,** and only from sessions that show subscription limits. One fetch serves every session on the machine.
+- **Failures fade out.** A failed fetch keeps the last result for up to 20 minutes, and after that the scoped limit disappears rather than going stale.
+- **Same forecast.** Each scoped limit gets the same pace and cap time, from readings recorded whenever it rises. The endpoint's reset times jitter by fractions of a second between fetches, so they are rounded to the minute.
+- **Its own top spender.** When only the Fable limit is running out, `top Fable:` ranks sessions by what they spent on Fable models alone.
+
+`USAGE_FORECAST_ACCOUNT=0` turns all of this off: no login is read and no request is made.
 
 #### Who is spending
 
@@ -228,7 +243,10 @@ Same contract: status line JSON on stdin, one line out, always exit 0, nothing w
 | `USAGE_FORECAST_STYLE` | `short` | `long` prints full sentences: `5-hour limit 52% used, 3.9× a sustainable pace: runs out about 15:36, resets 19:20.` |
 | `USAGE_FORECAST_TOP` | `warn` | When to name the top spender: `warn` (while a limit is red), `always`, or `never` (also skips the transcript scan) |
 | `USAGE_FORECAST_WINDOW` | `1800` | Seconds of spending the top spender's share covers |
-| `USAGE_FORECAST_CACHE_DIR` | `~/.cache/claude-statusline-plus` | Readings and scan results (`$XDG_CACHE_HOME` is honored) |
+| `USAGE_FORECAST_ACCOUNT` | `1` | `0` never reads the login or calls the usage endpoint, so no Fable limit is shown |
+| `USAGE_FORECAST_ACCOUNT_EVERY` | `300` | Seconds between usage-endpoint fetches |
+| `USAGE_FORECAST_KEYCHAIN` | unset | `1` reads the login from the macOS Keychain; macOS may ask once to allow it |
+| `USAGE_FORECAST_CACHE_DIR` | `~/.cache/claude-statusline-plus` | Readings, scan results and fetched limits (`$XDG_CACHE_HOME` is honored) |
 | `USAGE_FORECAST_PROJECTS` | `~/.claude/projects` | Transcripts to scan (`$CLAUDE_CONFIG_DIR` is honored) |
 | `USAGE_FORECAST_TAIL_BYTES` | `16777216` | Bytes read from the end of a large transcript |
 | `NO_COLOR` | unset | Disable ANSI colors |
@@ -299,7 +317,7 @@ tests/test_install.py          installer behavior against throwaway config direc
 
 Run the tests with `python -m pytest tests/ -q`. They need `bash`, `jq`, and `pytest`.
 
-The segments are tested through their real interface rather than by unit: every test pipes a payload, and where needed synthetic transcripts and readings, to the script and asserts on the line it prints. Both suites were hardened by mutation testing. The regression tests at the bottom of `test_cache_warm.py` each pin a bug that an earlier version of that suite missed. For `usage_forecast.sh`, 24 deliberately planted bugs were each caught before release: pricing, deduplication, the look-back, the record-only-a-new-high rule, and the scan's time and file filters.
+The segments are tested through their real interface rather than by unit: every test pipes a payload, and where needed synthetic transcripts and readings, to the script and asserts on the line it prints. Both suites were hardened by mutation testing. The regression tests at the bottom of `test_cache_warm.py` each pin a bug that an earlier version of that suite missed. For `usage_forecast.sh`, 38 deliberately planted bugs were each caught before release: pricing, deduplication, the look-back, the record-only-a-new-high rule, the scan's time and file filters, and the login handling for the Fable limit. The Fable tests run against a local stand-in for the usage endpoint, never the real one.
 
 ## Limitations
 
@@ -320,6 +338,8 @@ For the usage forecast:
 - **Prices are a table in the script.** A model that is not listed is priced like Opus 5. Update `price` in `usage_forecast.sh` when new models ship.
 - **The transcript scan depends on an undocumented file format.** If it changes, the top spender disappears; the percentages, pace, and forecast come from the documented payload and are unaffected.
 - **Subscriptions only.** API-key sessions get no `rate_limits`, so the segment prints nothing.
+- **The Fable limit comes from an undocumented endpoint.** If it changes or refuses the request, the Fable figure disappears; the 5-hour and weekly limits are unaffected. It is up to 5 minutes old, and it needs `curl`.
+- **On macOS the login is in the Keychain.** The Fable figure needs `USAGE_FORECAST_KEYCHAIN=1` there, or `CLAUDE_CODE_OAUTH_TOKEN`.
 
 For both:
 

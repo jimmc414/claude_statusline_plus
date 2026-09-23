@@ -54,7 +54,8 @@ def test_fresh_install_creates_scripts_and_settings(cfg):
 
 def run_status_line(cfg, payload, tmp_path):
     env = {**os.environ, "NO_COLOR": "1", "USAGE_FORECAST_CACHE_DIR": str(tmp_path / "usage-cache"),
-           "USAGE_FORECAST_TOP": "never"}
+           "USAGE_FORECAST_TOP": "never", "USAGE_FORECAST_ACCOUNT": "0", "CLAUDE_CONFIG_DIR": str(cfg)}
+    env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
     proc = subprocess.run(["bash", "-c", settings(cfg)["statusLine"]["command"]], text=True,
                           input=json.dumps(payload), capture_output=True, timeout=20, env=env)
     assert proc.returncode == 0, proc.stderr

@@ -4,70 +4,92 @@
 #
 # Reads the status line JSON payload on stdin and prints a single segment:
 #
-#     5h 12% · 7d 41%                          on track
+#     5h 12% · 7d 41% · Fable 78%              on track
 #     5h 48% 1.3× · 7d 41%                     (yellow) burning faster than the window lasts
 #     5h 53% 3.9× cap 15:36 (resets 19:20)     (red) at this pace the limit runs out first
 #     ... · top: refactor auth 57%             the session doing most of the burning
 #
-# Prints nothing when the payload has no rate_limits: API-key sessions, and
+# Prints nothing when there is no limit to show: API-key sessions, and
 # subscription sessions before their first response.
+#
+# The 5-hour and weekly limits come from the status line payload. Limits scoped
+# to one model, such as the weekly Fable limit, are not in the payload; they come
+# from the account usage endpoint behind /usage, fetched in the background every
+# 5 minutes with your Claude Code login. The login is only read: the token is
+# never refreshed, stored, or put on a command line.
 #
 # Pace is the burn rate as a multiple of the rate that uses exactly 100% over a
 # full window: 1.0× lasts the window, 4.0× empties it in a quarter of it. The rate
-# comes from readings this script records whenever the meter rises. Every session
-# on the machine shares them, so they follow the whole account, not one session.
-# It is measured over the last 30 minutes (5-hour window) or 6 hours (weekly);
-# until that much history exists, it is the average since the window opened.
+# comes from readings recorded whenever a limit rises. Every session on the
+# machine shares them, so they follow the whole account, not one session. It is
+# measured over the last 30 minutes (5-hour window) or 6 hours (weekly); until
+# that much history exists, it is the average since the window opened.
 #
 # "top:" names the session with the largest share of recent token spend, read from
 # the transcripts under ~/.claude/projects and weighted by list price. It shows
 # while a limit is on course to run out and more than one session is spending.
+# When only the Fable limit is, "top Fable:" ranks sessions by Fable spend alone.
 # The scan runs in the background and is cached, so the status line never waits.
 #
 # Environment:
-#   USAGE_FORECAST_STYLE        short (default) | long (full sentences)
-#   USAGE_FORECAST_TOP          warn (default) | always | never
-#   USAGE_FORECAST_WINDOW       seconds of spend the "top" share covers (default 1800)
-#   USAGE_FORECAST_CACHE_DIR    where readings and scan results live
-#                               (default ${XDG_CACHE_HOME:-~/.cache}/claude-statusline-plus)
-#   USAGE_FORECAST_PROJECTS     transcripts to scan (default ~/.claude/projects,
-#                               or $CLAUDE_CONFIG_DIR/projects)
-#   USAGE_FORECAST_TAIL_BYTES   bytes read from the end of a large transcript (default 16 MiB)
-#   USAGE_FORECAST_NOW          override current epoch seconds (for tests)
-#   USAGE_FORECAST_SYNC         1 = scan transcripts inline, not in the background (for tests)
-#   NO_COLOR                    disable ANSI colors
+#   USAGE_FORECAST_STYLE          short (default) | long (full sentences)
+#   USAGE_FORECAST_TOP            warn (default) | always | never
+#   USAGE_FORECAST_WINDOW         seconds of spend the "top" share covers (default 1800)
+#   USAGE_FORECAST_ACCOUNT        1 (default) | 0 = never read the login or call the usage endpoint
+#   USAGE_FORECAST_ACCOUNT_EVERY  seconds between usage-endpoint fetches (default 300)
+#   USAGE_FORECAST_KEYCHAIN       1 = on macOS, read the login from the Keychain (may ask once)
+#   USAGE_FORECAST_CACHE_DIR      where readings and fetched data live
+#                                 (default ${XDG_CACHE_HOME:-~/.cache}/claude-statusline-plus)
+#   USAGE_FORECAST_PROJECTS       transcripts to scan (default ~/.claude/projects,
+#                                 or $CLAUDE_CONFIG_DIR/projects)
+#   USAGE_FORECAST_TAIL_BYTES     bytes read from the end of a large transcript (default 16 MiB)
+#   USAGE_FORECAST_ACCOUNT_URL    usage endpoint (for tests)
+#   USAGE_FORECAST_NOW            override current epoch seconds (for tests)
+#   USAGE_FORECAST_SYNC           1 = fetch and scan inline, not in the background (for tests)
+#   NO_COLOR                      disable ANSI colors
 
 command -v jq >/dev/null 2>&1 || { cat >/dev/null; exit 0; }
 
 style="${USAGE_FORECAST_STYLE:-short}"
 top_mode="${USAGE_FORECAST_TOP:-warn}"
 window="${USAGE_FORECAST_WINDOW:-1800}"
+account_on="${USAGE_FORECAST_ACCOUNT:-1}"
+account_every="${USAGE_FORECAST_ACCOUNT_EVERY:-300}"
+account_url="${USAGE_FORECAST_ACCOUNT_URL:-https://api.anthropic.com/api/oauth/usage}"
 cache_dir="${USAGE_FORECAST_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-statusline-plus}"
-projects="${USAGE_FORECAST_PROJECTS:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects}"
+config_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+projects="${USAGE_FORECAST_PROJECTS:-$config_dir/projects}"
 tail_bytes="${USAGE_FORECAST_TAIL_BYTES:-16777216}"
 now="${USAGE_FORECAST_NOW:-}"
 # Digit caps keep every value inside bash's 64-bit arithmetic.
 [[ "$window" =~ ^[0-9]{1,7}$ ]] && [ "$window" -ge 60 ] || window=1800
+[[ "$account_every" =~ ^[0-9]{1,7}$ ]] && [ "$account_every" -ge 60 ] || account_every=300
 [[ "$tail_bytes" =~ ^[0-9]{1,11}$ ]] && [ "$tail_bytes" -ge 1024 ] || tail_bytes=16777216
 [[ "$now" =~ ^[0-9]{1,12}$ ]] || now=$(date +%s)
 case "$top_mode" in warn|always|never) ;; *) top_mode=warn ;; esac
 case "$style" in short|long) ;; *) style=short ;; esac
+[ "$account_on" = 0 ] || account_on=1
 projects="${projects%/}"
-samples="$cache_dir/usage_samples.tsv"
-fleet="$cache_dir/fleet.tsv"
-FLEET_EVERY=60      # rescan transcripts at most this often (seconds)
-FLEET_MAX_AGE=300   # never show a scan older than this
+samples="$cache_dir/usage_samples.tsv"      # 5-hour and weekly readings
+fleet="$cache_dir/fleet.tsv"                # last transcript scan
+account="$cache_dir/account.tsv"            # model-scoped limits from the last fetch
+scoped_samples="$cache_dir/scoped_samples.tsv"
+account_stamp="$cache_dir/account.attempt"  # when the endpoint was last tried
+FLEET_EVERY=60        # rescan transcripts at most this often (seconds)
+FLEET_MAX_AGE=300     # never show a scan older than this
+ACCOUNT_MAX_AGE=1200  # never show a fetched limit older than this
 
 # =============================================================================
 # Transcript scan: who is spending. Runs in the background (or inline for tests)
 # and writes $fleet: a "#<TAB>computed_at<TAB>window" header, then one line per
-# session, "session_id<TAB>list-price dollars<TAB>name", biggest spender first.
+# session, "session_id<TAB>dollars<TAB>Fable dollars<TAB>name", at list price,
+# biggest spender first.
 # =============================================================================
 
 # One transcript line in, at most one TSV line out:
-#   file U message_id dollars    an API call inside the window
-#   file N name                  the session's name (--name or /rename)
-#   file T title                 the session's AI-generated title
+#   file U message_id dollars F|-   an API call inside the window (F: a Fable model)
+#   file N name                     the session's name (--name or /rename)
+#   file T title                    the session's AI-generated title
 # -R + fromjson? skips the partial first line of a tail instead of failing.
 _scan='
 def ts: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;   # jq 1.7 rejects fractional seconds
@@ -95,7 +117,8 @@ inputs | fromjson? | objects
      and .message.model != "<synthetic>" and (.isApiErrorMessage | not) then
     (try (.timestamp | ts) catch null) as $t
     | if $t != null and $t >= $cutoff
-      then [$file, "U", ((.message.id // .requestId // .uuid // "") | tostring), (dollars | tostring)] | @tsv
+      then [$file, "U", ((.message.id // .requestId // .uuid // "") | tostring), (dollars | tostring),
+            (if (.message.model | strings // "") | test("fable|mythos") then "F" else "-" end)] | @tsv
       else empty end
   elif .type == "agent-name" and (.agentName | type) == "string" then [$file, "N", .agentName] | @tsv
   elif .type == "ai-title" and (.aiTitle | type) == "string" then [$file, "T", .aiTitle] | @tsv
@@ -122,6 +145,7 @@ $2 == "U" && NF >= 4 {
     seen[key] = 1
     s = sid_of($1); if (s == "") next
     cost[s] += $4; proj[s] = pj[$1]
+    if ($5 == "F") fable[s] += $4
     next
 }
 ($2 == "N" || $2 == "T") && NF >= 3 {
@@ -130,7 +154,7 @@ $2 == "U" && NF >= 4 {
 }
 END {
     for (s in cost) if (cost[s] > 0)
-        print s, proj[s], cost[s], ((s in name) ? name[s] : ((s in title) ? title[s] : "-"))
+        print s, proj[s], cost[s], fable[s] + 0, ((s in name) ? name[s] : ((s in title) ? title[s] : "-"))
 }'
 
 # title_of <main transcript> <session id>: the session's name, else its AI title,
@@ -150,15 +174,19 @@ title_of() {
     printf '%s' "$t"
 }
 
+# take_lock <dir>: an atomic mkdir lock; one left behind by a dead process is
+# taken over after 2 minutes.
+take_lock() {
+    mkdir "$1" 2>/dev/null && return 0
+    [ -n "$(find "$1" -maxdepth 0 -mmin +2 2>/dev/null)" ] || return 1
+    rm -rf "$1" && mkdir "$1" 2>/dev/null
+}
+
 refresh_fleet() {
     [ -d "$projects" ] || return 0
     mkdir -p "$cache_dir" 2>/dev/null || return 0
     _lock="$cache_dir/fleet.lock"
-    if ! mkdir "$_lock" 2>/dev/null; then
-        # A scan that died leaves its lock behind; take it over after 2 minutes.
-        [ -n "$(find "$_lock" -maxdepth 0 -mmin +2 2>/dev/null)" ] || return 0
-        rm -rf "$_lock" && mkdir "$_lock" 2>/dev/null || return 0
-    fi
+    take_lock "$_lock" || return 0
     trap 'rm -rf "$_lock"' EXIT
     local minutes=$(( window / 60 + 1 )) cutoff=$(( now - window ))
     local small_kb=$(( tail_bytes / 1024 )) tmp="$fleet.$$"
@@ -179,9 +207,9 @@ refresh_fleet() {
                         | jq -nrR --arg f "$f" --argjson cutoff "$cutoff" "$_scan" 2>/dev/null
                   done
         } | awk -v root="$projects" "$_aggregate" \
-          | while IFS=$'\t' read -r sid proj cost label; do
+          | while IFS=$'\t' read -r sid proj cost fable label; do
                 [ "$label" = "-" ] && label=$(title_of "$projects/$proj/$sid.jsonl" "$sid")
-                printf '%s\t%s\t%s\n' "$sid" "$cost" "$label"
+                printf '%s\t%s\t%s\t%s\n' "$sid" "$cost" "$fable" "$label"
             done \
           | sort -t "$(printf '\t')" -k2,2gr
     } >"$tmp" 2>/dev/null && mv "$tmp" "$fleet" 2>/dev/null
@@ -191,15 +219,106 @@ refresh_fleet() {
     trap - EXIT
 }
 
-if [ "${1:-}" = "--refresh-fleet" ]; then
-    refresh_fleet
-    exit 0
-fi
+# =============================================================================
+# Account fetch: model-scoped limits, which the status line payload does not
+# carry. Writes $account: a "#<TAB>fetched_at" header, then one line per scoped
+# limit, "name<TAB>percent<TAB>resets_at<TAB>window seconds"; and appends a
+# reading to $scoped_samples whenever a scoped limit rises.
+# =============================================================================
+
+# token_of: the Claude Code login's access token, or nothing. Never refreshed:
+# refreshing could invalidate the login Claude Code itself holds. An expired
+# token is skipped until Claude Code renews it.
+token_of() {
+    if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+        printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN"; return 0
+    fi
+    local creds=""
+    if [ -f "$config_dir/.credentials.json" ]; then
+        creds=$(cat "$config_dir/.credentials.json" 2>/dev/null)
+    elif [ "${USAGE_FORECAST_KEYCHAIN:-}" = 1 ] && command -v security >/dev/null 2>&1; then
+        creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+    fi
+    [ -n "$creds" ] || return 0
+    printf '%s' "$creds" | jq -r --argjson now_ms "$(( now * 1000 ))" '
+        .claudeAiOauth | objects | select((.accessToken | type) == "string" and .accessToken != "")
+        | select(.expiresAt | if type == "number" then . > $now_ms + 60000 else true end)
+        | .accessToken' 2>/dev/null
+}
+
+# The endpoint lists every limit under .limits; the scoped ones name a model (or
+# a surface) in .scope. Reset times arrive as ISO strings with microseconds that
+# jitter between fetches, so they are rounded to the minute.
+_account='
+def epoch:
+  capture("^(?<b>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\\.[0-9]+)?(?<z>Z|[+-][0-9]{2}:[0-9]{2})$") as $m
+  | (($m.b + "Z") | fromdateiso8601)
+    - (if $m.z == "Z" then 0
+       else (($m.z[1:3] | tonumber) * 3600 + ($m.z[4:6] | tonumber) * 60)
+            * (if $m.z[0:1] == "-" then -1 else 1 end) end);
+def scopename: [.scope | objects | (.model, .surface) | objects | .display_name | strings
+                | gsub("[[:cntrl:]]"; "") | select(length > 0)] | first;
+[ .limits[]? | objects
+  | scopename as $name | select($name != null)
+  | (.percent | numbers) as $u
+  | ((.resets_at | strings | try epoch catch null) // null) as $r
+  | select($r != null)
+  | {name: $name[0:16], u: $u, r: ((($r + 30) / 60 | floor) * 60),
+     len: (if .group == "session" then 18000 else 604800 end)} ] as $limits
+| [ $samples | split("\n")[] | split("\t") | select(length == 4)
+    | [(.[0] | tonumber? // null), .[1], (.[2] | tonumber? // null), (.[3] | tonumber? // null)] ] as $seen
+| ($limits[] | "W\t\(.name)\t\(.u)\t\(.r)\t\(.len)"),
+  ($limits[] | . as $l
+   | ([$seen[] | select(.[1] == $l.name and .[3] == $l.r) | .[2] | numbers] | max) as $max
+   | select($max == null or $l.u > $max)
+   | "S\t\($now)\t\($l.name)\t\($l.u)\t\($l.r)")'
+
+refresh_account() {
+    mkdir -p "$cache_dir" 2>/dev/null || return 0
+    printf '%s\n' "$now" >"$account_stamp" 2>/dev/null   # no retry storm when a fetch fails
+    command -v curl >/dev/null 2>&1 || return 0
+    _alock="$cache_dir/account.lock"
+    take_lock "$_alock" || return 0
+    trap 'rm -rf "$_alock"' EXIT
+    local token reply code body parsed tmp="$account.$$"
+    token=$(token_of)
+    if [ -n "$token" ]; then
+        # The token reaches curl on stdin, never on a command line.
+        reply=$(printf 'Authorization: Bearer %s\n' "$token" \
+            | curl -sS --max-time 10 -H @- -H 'anthropic-beta: oauth-2025-04-20' -H 'Accept: application/json' \
+                   -w '\n%{http_code}' "$account_url" 2>/dev/null)
+        token=""
+        code=${reply##*$'\n'}
+        body=${reply%$'\n'*}
+        if [ "$code" = 200 ] && parsed=$(printf '%s' "$body" | jq -r --argjson now "$now" \
+                --arg samples "$(tail -n 400 "$scoped_samples" 2>/dev/null)" "$_account" 2>/dev/null); then
+            {
+                printf '#\t%s\n' "$now"
+                printf '%s\n' "$parsed" | awk -F'\t' -v OFS='\t' '$1 == "W" { print $2, $3, $4, $5 }'
+            } >"$tmp" 2>/dev/null && mv "$tmp" "$account" 2>/dev/null
+            rm -f "$tmp"
+            printf '%s\n' "$parsed" | awk -F'\t' -v OFS='\t' '$1 == "S" { print $2, $3, $4, $5 }' \
+                >>"$scoped_samples" 2>/dev/null
+            if [ -n "$(find "$scoped_samples" -size +64k 2>/dev/null)" ]; then
+                tail -n 500 "$scoped_samples" >"$scoped_samples.$$" 2>/dev/null \
+                    && mv "$scoped_samples.$$" "$scoped_samples" 2>/dev/null
+                rm -f "$scoped_samples.$$"
+            fi
+        fi
+    fi
+    rm -rf "$_alock"
+    trap - EXIT
+}
+
+case "${1:-}" in
+    --refresh-fleet)   refresh_fleet;   exit 0 ;;
+    --refresh-account) refresh_account; exit 0 ;;
+esac
 
 # =============================================================================
-# Render: one jq call over the payload, the recent readings and the last scan.
-# Prints three lines: a reading to record (or nothing), "refresh" when the scan
-# should be redone, and the segment itself.
+# Render: one jq call over the payload, the recent readings, the last scan and
+# the last account fetch. Prints three lines: a reading to record (or nothing),
+# the background jobs that are due ("fleet", "account"), and the segment.
 # =============================================================================
 _render='
 def num: if type == "number" and (isinfinite | not) and (isnan | not) then . else null end;
@@ -212,8 +331,8 @@ def x: (if . >= 10 then ((. + 0.5) | floor) else ((. * 10 + 0.5) | floor) / 10 e
 def clean: gsub("[[:cntrl:]]"; "");
 def trunc($n): if length > $n then .[0:$n - 1] + "…" else . end;
 
-# A window from the payload, or null when it is missing, malformed, already past
-# its reset, or claims to reset further out than a window lasts.
+# A window, or null when it is missing, malformed, already past its reset, or
+# claims to reset further out than a window lasts.
 def win($o; $len):
   if ($o | type) != "object" then null else
     ($o.used_percentage | num) as $u | ($o.resets_at | num) as $r
@@ -223,10 +342,14 @@ def win($o; $len):
       else {u: $u, r: ($r | floor), len: $len} end
   end;
 
-# Readings: epoch, 5h used, 5h reset, 7d used, 7d reset ("-" when not recorded).
+# 5-hour and weekly readings: epoch, 5h used, 5h reset, 7d used, 7d reset.
 def rows: [ $samples | split("\n")[] | split("\t") | select(length == 5)
             | map(if . == "-" or . == "" then null else (tonumber? // null) end)
             | select(.[0] != null) ];
+# Scoped readings: epoch, name, used, reset.
+def srows: [ $scoped | split("\n")[] | split("\t") | select(length == 4)
+             | [(.[0] | tonumber? // null), .[1], (.[2] | tonumber? // null), (.[3] | tonumber? // null)]
+             | select(.[0] != null and .[2] != null and .[3] != null) ];
 
 # True when this payload raises the highest reading recorded for its window.
 # Usage never falls inside a window, so a lower value is a stale session.
@@ -234,24 +357,25 @@ def newer($w; $ui; $ri; $rows):
   $w != null and (([$rows[] | select(.[$ri] == $w.r) | .[$ui] | numbers] | max) as $m
                   | ($m == null or $w.u > $m));
 
-def analyze($w; $ui; $ri; $rows):
+# [epoch, used] pairs recorded for a window.
+def pairs($rows; $ui; $ri; $w):
+  if $w == null then [] else [$rows[] | select(.[$ri] == $w.r and (.[$ui] | numbers) != null) | [.[0], .[$ui]]] end;
+
+def analyze($w; $ws):
   if $w == null then null
   elif $w.len == 0 then
     {u: $w.u, r: $w.r, len: 0, pace: null, eta: null, capped: ($w.u >= 100),
      red: ($w.u >= 100), yellow: ($w.u >= 80)}
   else
-    [$rows[] | select(.[$ri] == $w.r and (.[$ui] | numbers) != null)] as $ws
-    | ([$w.u, ([$ws[] | .[$ui]] | max // 0)] | max) as $u
+    ([$w.u, ([$ws[] | .[1]] | max // 0)] | max) as $u
     | $w.len as $L
     | (if $L == 18000 then 1800 else 21600 end) as $look
     | (if $L == 18000 then 600 else 3600 end) as $span
     # Usage at the start of the look-back: the last reading before it (flat until
     # the next one), else the oldest reading inside it.
     | ([$ws[] | select(.[0] < $now - $look)] | max_by(.[0])) as $prev
-    | (if $prev != null then [$now - $look, $prev[$ui]]
-       else ([$ws[] | select(.[0] <= $now)] | min_by(.[0])) as $o
-            | if $o == null then null else [$o[0], $o[$ui]] end
-       end) as $ref
+    | (if $prev != null then [$now - $look, $prev[1]]
+       else ([$ws[] | select(.[0] <= $now)] | min_by(.[0])) end) as $ref
     | (if $ref != null and ($now - $ref[0]) >= $span
        then ([$u - $ref[1], 0] | max) / ($now - $ref[0]) else null end) as $recent
     | ($now - ($w.r - $L)) as $el
@@ -301,14 +425,35 @@ def long($a; $name):
 | win($rl.five_hour; 18000) as $w5
 | win($rl.seven_day; 604800) as $w7
 | win($rl.spend_limit; 0) as $wsp
+
+# Scoped limits from the last account fetch, if recent enough to trust. They
+# belong to the Claude login, so they only show beside the 5-hour or weekly
+# limits in the payload: an API-key or gateway session does not draw on them.
+| ($account | split("\n")) as $al
+| (($al[0] // "") | split("\t")) as $ah
+| (if ($ah | length) >= 2 and $ah[0] == "#" then ($ah[1] | tonumber? // null) else null end) as $aat
+| (if ($w5 != null or $w7 != null) and $aat != null and ($now - $aat) <= $acct_max_age then
+     [ $al[1:][] | split("\t") | select(length == 4)
+       | {name: (.[0] | clean | trunc(16)), u: (.[1] | tonumber? // null),
+          r: (.[2] | tonumber? // null), len: (.[3] | tonumber? // null)}
+       | select(.name != "" and (.len == 18000 or .len == 604800)) as $s
+       | win({used_percentage: $s.u, resets_at: $s.r}; $s.len) | select(. != null) | . + {name: $s.name} ]
+   else [] end) as $sw
+
 | if $w5 == null and $w7 == null and $wsp == null then "", "", "" else
     rows as $rows
-    | analyze($w5; 1; 2; $rows) as $a5
-    | analyze($w7; 3; 4; $rows) as $a7
-    | analyze($wsp; 0; 0; $rows) as $asp
-    | ([$a5, $a7, $asp] | map(select(. != null))) as $all
-    | ($all | any(.red)) as $red
-    | ($all | any(.yellow)) as $yellow
+    | srows as $srows
+    | analyze($w5; pairs($rows; 1; 2; $w5)) as $a5
+    | analyze($w7; pairs($rows; 3; 4; $w7)) as $a7
+    | analyze($wsp; []) as $asp
+    | [ $sw[] | . as $w
+        | analyze($w; [$srows[] | select(.[1] == $w.name and .[3] == $w.r) | [.[0], .[2]]])
+        | . + {name: $w.name} ] as $as
+    | ([$a5, $a7, $asp] | map(select(. != null))) as $main
+    | ($main | any(.red)) as $red_main
+    | (($main + $as) | any(.red)) as $red
+    | (($main + $as) | any(.yellow)) as $yellow
+    | ($as | map(select(.name | ascii_downcase | test("fable"))) | any(.red)) as $red_fable
 
     # Record this reading when it raises the known maximum for its window.
     | newer($w5; 1; 2; $rows) as $n5
@@ -319,57 +464,89 @@ def long($a; $name):
          | map(tostring) | join("\t")
        else "" end) as $append
 
-    # The last transcript scan, if recent enough to trust.
+    # The last transcript scan, if recent enough to trust. When only the Fable
+    # limit is running out, sessions are ranked by what they spent on Fable.
     | ($fleet | split("\n")) as $fl
     | (($fl[0] // "") | split("\t")) as $h
     | (if ($h | length) >= 2 and $h[0] == "#" then ($h[1] | tonumber? // null) else null end) as $at
+    | (($red_main | not) and $red_fable) as $by_fable
     | (if $at != null and ($now - $at) <= $max_age then
-         [ $fl[1:][] | split("\t") | select(length >= 3)
-           | {sid: .[0], cost: (.[1] | tonumber? // 0), label: (.[2:] | join(" ") | clean)}
-           | select(.cost > 0) ] | sort_by(-.cost)
+         [ $fl[1:][] | split("\t") | select(length >= 4)
+           | {sid: .[0], v: (if $by_fable then .[2] else .[1] end | tonumber? // 0),
+              label: (.[3:] | join(" ") | clean)}
+           | select(.v > 0) ] | sort_by(-.v)
        else [] end) as $fr
-    | ($fr | map(.cost) | add // 0) as $total
-    | (if ($top == "always" or ($top == "warn" and $red)) and ($fr | length) >= 2 and $total > 0 then
+    | ($fr | map(.v) | add // 0) as $total
+    | (($p.session_id | strings) // "") as $me
+    | (if ($top == "always" or ($top == "warn" and $red)) and ($fr | length) >= 1 and $total > 0
+          and (($fr | length) >= 2 or $fr[0].sid != $me) then
          $fr[0] as $t
-         | {label: (if $t.sid == (($p.session_id | strings) // "") then "this session"
+         | {label: (if $t.sid == $me then "this session"
                     elif $t.label == "" then "session " + $t.sid[0:8]
                     else $t.label | trunc(28) end),
-            share: (($t.cost / $total * 100 + 0.5) | floor)}
+            share: (($t.v / $total * 100 + 0.5) | floor)}
        else null end) as $topinfo
-    | (if ($top == "always" or ($top == "warn" and ($red or $yellow)))
-          and ($at == null or ($now - $at) >= $every) then "refresh" else "" end) as $refresh
+
+    | ([ (if ($top == "always" or ($top == "warn" and ($red or $yellow)))
+             and ($at == null or ($now - $at) >= $every) then "fleet" else empty end),
+         (if $acct_on == "1" and ($w5 != null or $w7 != null) and ($now - $acct_attempt) >= $acct_every
+          then "account" else empty end) ] | join(" ")) as $jobs
 
     | (if $style == "long" then
-         ([long($a5; "5-hour limit"), long($a7; "Weekly limit"), long($asp; "Spend limit")] | join(" "))
+         ([long($a5; "5-hour limit"), long($a7; "Weekly limit"),
+           ($as[] | long(.; "\(.name) \(if .len == 18000 then "5-hour" else "weekly" end) limit")),
+           long($asp; "Spend limit")] | join(" "))
          + (if $topinfo == null then ""
-            else " Top spender: \($topinfo.label) (\($topinfo.share)% of recent spend)." end)
+            else " Top \(if $by_fable then "Fable spender" else "spender" end): \($topinfo.label)"
+                 + " (\($topinfo.share)% of recent \(if $by_fable then "Fable " else "" end)spending)." end)
        else
-         ([short($a5; "5h"), short($a7; "7d"), short($asp; "spend")] | join(" · "))
+         ([short($a5; "5h"), short($a7; "7d"), ($as[] | short(.; .name)), short($asp; "spend")] | join(" · "))
          + (if $topinfo == null then ""
-            else " · " + c("2") + "top:" + c("0") + " \($topinfo.label) \($topinfo.share)%" end)
+            else " · " + c("2") + (if $by_fable then "top Fable:" else "top:" end) + c("0")
+                 + " \($topinfo.label) \($topinfo.share)%" end)
        end) as $text
-    | $append, $refresh, $text
+    | $append, $jobs, $text
   end'
 
 input=$(cat)
-samples_tail=""
-[ -f "$samples" ] && samples_tail=$(tail -n 400 "$samples" 2>/dev/null)
-fleet_text=""
-if [ "$top_mode" != never ]; then
-    [ "${USAGE_FORECAST_SYNC:-}" = 1 ] && ( refresh_fleet )
-    [ -f "$fleet" ] && fleet_text=$(head -c 65536 "$fleet" 2>/dev/null)
-fi
+sync="${USAGE_FORECAST_SYNC:-}"
 color=1
 [ -n "${NO_COLOR:-}" ] && color=""
 
-append=""; refresh=""; text=""
-{
-    IFS= read -r append
-    IFS= read -r refresh
-    IFS= read -r text
-} < <(printf '%s' "$input" | jq -r --argjson now "$now" --arg samples "$samples_tail" \
-        --arg fleet "$fleet_text" --arg style "$style" --arg top "$top_mode" --arg color "$color" \
-        --argjson every "$FLEET_EVERY" --argjson max_age "$FLEET_MAX_AGE" "$_render" 2>/dev/null)
+load_state() {
+    samples_tail=""; fleet_text=""; account_text=""; scoped_tail=""; account_attempt=0
+    [ -f "$samples" ] && samples_tail=$(tail -n 400 "$samples" 2>/dev/null)
+    [ "$top_mode" != never ] && [ -f "$fleet" ] && fleet_text=$(head -c 65536 "$fleet" 2>/dev/null)
+    if [ "$account_on" = 1 ]; then
+        [ -f "$account" ] && account_text=$(head -c 16384 "$account" 2>/dev/null)
+        [ -f "$scoped_samples" ] && scoped_tail=$(tail -n 400 "$scoped_samples" 2>/dev/null)
+        [ -f "$account_stamp" ] && account_attempt=$(head -n 1 "$account_stamp" 2>/dev/null)
+        [[ "$account_attempt" =~ ^[0-9]{1,12}$ ]] || account_attempt=0
+    fi
+}
+
+render() {
+    append=""; jobs=""; text=""
+    {
+        IFS= read -r append
+        IFS= read -r jobs
+        IFS= read -r text
+    } < <(printf '%s' "$input" | jq -r --argjson now "$now" --arg samples "$samples_tail" \
+            --arg scoped "$scoped_tail" --arg fleet "$fleet_text" --arg account "$account_text" \
+            --arg style "$style" --arg top "$top_mode" --arg color "$color" --arg acct_on "$account_on" \
+            --argjson acct_attempt "$account_attempt" --argjson acct_every "$account_every" \
+            --argjson acct_max_age "$ACCOUNT_MAX_AGE" --argjson every "$FLEET_EVERY" \
+            --argjson max_age "$FLEET_MAX_AGE" "$_render" 2>/dev/null)
+}
+
+[ "$sync" = 1 ] && [ "$top_mode" != never ] && ( refresh_fleet )
+load_state
+render
+if [ "$sync" = 1 ] && [[ " $jobs " == *" account "* ]]; then
+    ( refresh_account )
+    load_state
+    render
+fi
 
 if [ -n "$append" ] && mkdir -p "$cache_dir" 2>/dev/null; then
     printf '%s\n' "$append" >>"$samples" 2>/dev/null
@@ -380,14 +557,18 @@ if [ -n "$append" ] && mkdir -p "$cache_dir" 2>/dev/null; then
     fi
 fi
 
-if [ "$refresh" = refresh ] && [ "${USAGE_FORECAST_SYNC:-}" != 1 ] && [ -d "$projects" ]; then
-    # Detached, so the status line never waits for it and a cancelled render
-    # does not take the scan down with it.
+# Background jobs run detached, so the status line never waits for them and a
+# cancelled render does not take them down with it.
+spawn() {
     if command -v setsid >/dev/null 2>&1; then
-        setsid bash "${BASH_SOURCE[0]}" --refresh-fleet </dev/null >/dev/null 2>&1 &
+        setsid bash "${BASH_SOURCE[0]}" "$1" </dev/null >/dev/null 2>&1 &
     else
-        nohup bash "${BASH_SOURCE[0]}" --refresh-fleet </dev/null >/dev/null 2>&1 &
+        nohup bash "${BASH_SOURCE[0]}" "$1" </dev/null >/dev/null 2>&1 &
     fi
+}
+if [ "$sync" != 1 ]; then
+    [[ " $jobs " == *" fleet "* ]] && [ -d "$projects" ] && spawn --refresh-fleet
+    [[ " $jobs " == *" account "* ]] && spawn --refresh-account
 fi
 
 [ -n "$text" ] && printf '%s\n' "$text"

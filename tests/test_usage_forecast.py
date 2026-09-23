@@ -3,8 +3,10 @@
 import json
 import os
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -40,11 +42,16 @@ class Runner:
     def __init__(self, tmp_path):
         self.cache = tmp_path / "cache"
         self.projects = tmp_path / "projects"
+        self.config = tmp_path / "claude"
 
     def __call__(self, payload, now, stdin=None, **env):
+        # The account fetch is off unless a test turns it on, and the Claude config
+        # directory is a throwaway one, so no test can ever read a real login.
         full_env = {**os.environ, "NO_COLOR": "1", "TZ": "UTC", "USAGE_FORECAST_NOW": str(now),
                     "USAGE_FORECAST_CACHE_DIR": str(self.cache), "USAGE_FORECAST_PROJECTS": str(self.projects),
-                    "USAGE_FORECAST_SYNC": "1", **env}
+                    "USAGE_FORECAST_SYNC": "1", "USAGE_FORECAST_ACCOUNT": "0",
+                    "CLAUDE_CONFIG_DIR": str(self.config), "CLAUDE_CODE_OAUTH_TOKEN": None,
+                    "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost", **env}
         for key in [k for k, v in full_env.items() if v is None]:
             del full_env[key]
         proc = subprocess.run(["bash", str(SCRIPT)], text=True, capture_output=True, env=full_env,
@@ -428,7 +435,245 @@ def test_a_live_scan_lock_is_respected(run):
 
 def test_an_old_scan_is_not_shown(run):
     run.cache.mkdir(parents=True)
-    (run.cache / "fleet.tsv").write_text(f"#\t{NOW - 3600}\t1800\n{SID_B}\t60\tb\n{SID_A}\t20\ta\n")
+    (run.cache / "fleet.tsv").write_text(f"#\t{NOW - 3600}\t1800\n{SID_B}\t60\t0\tb\n{SID_A}\t20\t0\ta\n")
     out = run({**limits(u5=52), "session_id": SID_A}, now=NOW, USAGE_FORECAST_TOP="warn",
               USAGE_FORECAST_PROJECTS=str(run.projects / "missing"))
     assert out == RED
+
+
+# =============================================================================
+# Model-scoped limits (Fable) from the account usage endpoint
+# =============================================================================
+
+class _UsageEndpoint(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.server.requests.append({k.lower(): v for k, v in self.headers.items()})
+        status, body = self.server.reply
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body.encode())
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture
+def usage_api():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _UsageEndpoint)
+    server.requests = []
+    server.reply = (200, "{}")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield server
+    server.shutdown()
+    server.server_close()
+
+
+AT = S5 + 2 * HOUR      # Mon 16:20 UTC; the weekly window opened 98 hours ago
+
+
+def endpoint_time(epoch, micros="708782"):
+    """Reset times as the endpoint writes them: microseconds that vary, and +00:00."""
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime(f"%Y-%m-%dT%H:%M:%S.{micros}+00:00")
+
+
+def usage_reply(fable=None, micros="708782", extra=(), late=0):
+    limits = [
+        {"kind": "session", "group": "session", "percent": 12, "severity": "normal",
+         "resets_at": endpoint_time(R5 - 1, micros), "scope": None, "is_active": True},
+        {"kind": "weekly_all", "group": "weekly", "percent": 41, "severity": "normal",
+         "resets_at": endpoint_time(R7 - 1, micros), "scope": None, "is_active": False},
+    ]
+    if fable is not None:
+        limits.append({"kind": "weekly_scoped", "group": "weekly", "percent": fable, "severity": "warning",
+                       "resets_at": endpoint_time(R7 - 1 + late, micros),
+                       "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None},
+                       "is_active": False})
+    limits.extend(extra)
+    return 200, json.dumps({"five_hour": {"utilization": 12.0}, "seven_day_omelette": None, "limits": limits})
+
+
+def login(run, now, token="tok-123", expires_in=HOUR):
+    run.config.mkdir(parents=True, exist_ok=True)
+    (run.config / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": token, "refreshToken": "ref-456", "expiresAt": (now + expires_in) * 1000,
+        "subscriptionType": "max"}}))
+
+
+def with_account(api, **env):
+    return {"USAGE_FORECAST_ACCOUNT": "1",
+            "USAGE_FORECAST_ACCOUNT_URL": f"http://127.0.0.1:{api.server_port}/api/oauth/usage", **env}
+
+
+def fable_red(u, now=AT):
+    # The window average over the 98 hours since the weekly window opened.
+    elapsed = now - (R7 - WEEK)
+    rate = u / elapsed
+    pace = round(rate * WEEK / 100 + 1e-9, 1)
+    eta = now + (100 - u) / rate
+    return f"Fable {u}% {pace}× cap {utc(eta, '%a %H:%M')} (resets {utc(R7, '%a %H:%M')})"
+
+
+def test_the_fable_limit_shows_after_the_weekly_one(run, usage_api):
+    login(run, AT)
+    usage_api.reply = usage_reply(fable=50)
+    assert run(limits(u5=12, u7=41), now=AT, **with_account(usage_api)) == "5h 12% · 7d 41% · Fable 50%"
+
+
+def test_the_fable_limit_can_run_out_first(run, usage_api):
+    login(run, AT)
+    usage_api.reply = usage_reply(fable=78)
+    out = run(limits(u5=12, u7=41), now=AT, **with_account(usage_api))
+    assert out == "5h 12% · 7d 41% · " + fable_red(78)
+    assert out.endswith("1.3× cap Tue 19:58 (resets Thu 14:20)")
+
+
+def test_long_style_names_the_fable_limit(run, usage_api):
+    login(run, AT)
+    usage_api.reply = usage_reply(fable=50)
+    out = run(limits(u5=12, u7=41), now=AT, USAGE_FORECAST_STYLE="long", **with_account(usage_api))
+    assert out == "5-hour limit 12% used. Weekly limit 41% used. Fable weekly limit 50% used."
+
+
+def test_fable_readings_give_a_recent_pace(run, usage_api):
+    # 50% -> 60% in two hours is 5% an hour: 8.4x a week's worth. The two fetches
+    # report the reset a moment apart, across a second boundary, as real ones can.
+    login(run, AT, expires_in=DAY)
+    usage_api.reply = usage_reply(fable=50, micros="999000")
+    run(limits(u5=12, u7=41), now=AT, **with_account(usage_api))
+    usage_api.reply = usage_reply(fable=60, micros="001000", late=1)
+    out = run(limits(u5=12, u7=41), now=AT + 2 * HOUR, **with_account(usage_api))
+    assert out.endswith(f"Fable 60% 8.4× cap {utc(AT + 10 * HOUR, '%a %H:%M')} (resets Thu 14:20)")
+
+
+def test_a_fable_reading_is_recorded_only_when_it_rises(run, usage_api):
+    login(run, AT, expires_in=DAY)
+    for offset, fable in ((0, 50), (300, 50), (600, 49), (900, 51)):
+        usage_api.reply = usage_reply(fable=fable)
+        run(limits(u5=12, u7=41), now=AT + offset, **with_account(usage_api))
+    rows = [line.split("\t") for line in (run.cache / "scoped_samples.tsv").read_text().splitlines()]
+    assert [(r[0], r[1], r[2]) for r in rows] == [(str(AT), "Fable", "50"), (str(AT + 900), "Fable", "51")]
+    assert len(usage_api.requests) == 4
+
+
+def test_the_login_token_goes_in_a_header_and_nowhere_else(run, usage_api):
+    login(run, AT)
+    usage_api.reply = usage_reply(fable=50)
+    run(limits(u5=12, u7=41), now=AT, **with_account(usage_api))
+    assert len(usage_api.requests) == 1
+    assert usage_api.requests[0]["authorization"] == "Bearer tok-123"
+    assert usage_api.requests[0]["anthropic-beta"] == "oauth-2025-04-20"
+    for path in run.cache.rglob("*"):
+        if path.is_file():
+            assert "tok-123" not in path.read_text(errors="replace")
+            assert "ref-456" not in path.read_text(errors="replace")
+
+
+def test_an_expired_login_is_not_used(run, usage_api):
+    login(run, AT, expires_in=-10)
+    usage_api.reply = usage_reply(fable=50)
+    assert run(limits(u5=12, u7=41), now=AT, **with_account(usage_api)) == "5h 12% · 7d 41%"
+    assert usage_api.requests == []
+
+
+def test_an_explicit_oauth_token_wins(run, usage_api):
+    login(run, AT)
+    usage_api.reply = usage_reply(fable=50)
+    run(limits(u5=12, u7=41), now=AT, CLAUDE_CODE_OAUTH_TOKEN="env-tok", **with_account(usage_api))
+    assert usage_api.requests[0]["authorization"] == "Bearer env-tok"
+
+
+def test_no_login_means_no_request(run, usage_api):
+    usage_api.reply = usage_reply(fable=50)
+    assert run(limits(u5=12, u7=41), now=AT, **with_account(usage_api)) == "5h 12% · 7d 41%"
+    assert usage_api.requests == []
+
+
+def test_the_account_fetch_can_be_turned_off(run, usage_api):
+    login(run, AT)
+    usage_api.reply = usage_reply(fable=50)
+    out = run(limits(u5=12, u7=41), now=AT, **with_account(usage_api, USAGE_FORECAST_ACCOUNT="0"))
+    assert out == "5h 12% · 7d 41%"
+    assert usage_api.requests == []
+
+
+def test_no_request_before_the_session_has_subscription_limits(run, usage_api):
+    login(run, AT)
+    usage_api.reply = usage_reply(fable=50)
+    assert run({"model": {"id": "claude-fable-5-1"}}, now=AT, **with_account(usage_api)) == ""
+    assert usage_api.requests == []
+
+
+def test_a_gateway_session_neither_fetches_nor_shows_login_limits(run, usage_api):
+    # A fresh fetch from another session is on disk, but this session is billed
+    # through a gateway: only its spend limit applies.
+    login(run, AT)
+    run.cache.mkdir(parents=True)
+    (run.cache / "account.tsv").write_text(f"#\t{AT}\nFable\t50\t{R7}\t{WEEK}\n")
+    payload = limits(spend=62, spend_reset=AT + 10 * DAY)
+    assert run(payload, now=AT, **with_account(usage_api)) == "spend 62%"
+    assert usage_api.requests == []
+
+
+def test_the_endpoint_is_asked_at_most_every_five_minutes(run, usage_api):
+    login(run, AT, expires_in=DAY)
+    usage_api.reply = usage_reply(fable=50)
+    for offset in (0, 60, 299):
+        run(limits(u5=12, u7=41), now=AT + offset, **with_account(usage_api))
+    assert len(usage_api.requests) == 1
+    run(limits(u5=12, u7=41), now=AT + 300, **with_account(usage_api))
+    assert len(usage_api.requests) == 2
+
+
+def test_a_failed_fetch_keeps_the_last_limits_until_they_are_stale(run, usage_api):
+    login(run, AT, expires_in=DAY)
+    usage_api.reply = usage_reply(fable=50)
+    assert run(limits(u5=12, u7=41), now=AT, **with_account(usage_api)).endswith("Fable 50%")
+    usage_api.reply = (401, '{"error": "expired"}')
+    assert run(limits(u5=12, u7=41), now=AT + 600, **with_account(usage_api)).endswith("Fable 50%")
+    assert run(limits(u5=12, u7=41), now=AT + 1500, **with_account(usage_api)) == "5h 12% · 7d 41%"
+    assert len(usage_api.requests) == 3
+
+
+@pytest.mark.parametrize("body", ["not json", "[]", '{"limits": "none"}', '{"limits": [null, 7]}'])
+def test_a_garbage_reply_is_ignored(run, usage_api, body):
+    login(run, AT)
+    usage_api.reply = (200, body)
+    assert run(limits(u5=12, u7=41), now=AT, **with_account(usage_api)) == "5h 12% · 7d 41%"
+
+
+def test_a_scoped_limit_needs_a_name_and_a_reset(run, usage_api):
+    login(run, AT)
+    nameless = {"kind": "weekly_scoped", "group": "weekly", "percent": 90, "resets_at": endpoint_time(R7),
+                "scope": {"model": {"id": None, "display_name": None}, "surface": None}}
+    no_reset = {"kind": "weekly_scoped", "group": "weekly", "percent": 90, "resets_at": None,
+                "scope": {"model": {"display_name": "Sonnet"}}}
+    usage_api.reply = usage_reply(fable=50, extra=[nameless, no_reset])
+    assert run(limits(u5=12, u7=41), now=AT, **with_account(usage_api)) == "5h 12% · 7d 41% · Fable 50%"
+
+
+def test_other_scoped_limits_are_shown_by_their_name(run, usage_api):
+    login(run, AT)
+    sonnet = {"kind": "weekly_scoped", "group": "weekly", "percent": 20, "resets_at": endpoint_time(R7),
+              "scope": {"model": {"id": None, "display_name": "Sonnet"}, "surface": None}}
+    usage_api.reply = usage_reply(fable=50, extra=[sonnet])
+    assert run(limits(u5=12, u7=41), now=AT, **with_account(usage_api)) == "5h 12% · 7d 41% · Fable 50% · Sonnet 20%"
+
+
+def test_when_only_fable_runs_out_the_top_spender_is_ranked_by_fable(run, usage_api):
+    # A spent $20 on Opus 5.5, B $5 on Fable 5.1: by Fable spending, B is the whole of it.
+    login(run, AT)
+    usage_api.reply = usage_reply(fable=78)
+    transcript(run, SID_A, [title("a"), call(AT - 60, "m1", out=1_000_000)])
+    transcript(run, SID_B, [title("b"), call(AT - 60, "m2", model="claude-fable-5-1", out=100_000)])
+    out = run({**limits(u5=12, u7=41), "session_id": SID_A}, now=AT, **with_account(usage_api))
+    assert out == "5h 12% · 7d 41% · " + fable_red(78) + " · top Fable: b 100%"
+
+
+def test_when_the_five_hour_limit_runs_out_too_all_spending_counts(run, usage_api):
+    login(run, AT)
+    usage_api.reply = usage_reply(fable=78)
+    transcript(run, SID_A, [title("a"), call(AT - 60, "m1", out=1_000_000)])
+    transcript(run, SID_B, [title("b"), call(AT - 60, "m2", model="claude-fable-5-1", out=100_000)])
+    out = run({**limits(u5=90, u7=41), "session_id": SID_B}, now=AT, **with_account(usage_api))
+    assert out.endswith(" · top: a 80%")
