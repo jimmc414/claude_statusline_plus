@@ -2,6 +2,8 @@
 
 Claude Code status line segments that show what the CLI knows but does not display: whether your prompt cache is still warm, and whether your usage limits will last until they reset.
 
+![Claude Code status line: cache warm 58m, 5h 85% in yellow with (resets in 16m), 7d 71%, Fable 80%](docs/statusline.png)
+
 ```
 cache warm 31m · 5h 12% (resets in 3h00m) · 7d 41% · Fable 50%
 cache warm 31m · 5h 53% 3.9× cap 15:36 (resets in 4h20m) · 7d 38% · Fable 50% · top: refactor auth 57%
